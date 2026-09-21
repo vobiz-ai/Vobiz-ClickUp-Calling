@@ -1,0 +1,13 @@
+node_modules/
+backend/.env
+.env
+backend/tunnel-url.txt
+scripts/tunnel-url.txt
+*.log
+.DS_Store
+
+
+# Tunnel binary — install cloudflared, do not commit a 54 MB executable
+backend/cloudflared.exe
+cloudflared
+cloudflared.exe

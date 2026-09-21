@@ -1,0 +1,28 @@
+{
+  "name": "vobiz-clickup-integration",
+  "version": "1.0.0",
+  "description": "Vobiz SIP & Voice Platform Integration for ClickUp (Inbound, Outbound, CDR Sync, and Recording Playback)",
+  "main": "backend/server.js",
+  "scripts": {
+    "start": "node backend/server.js",
+    "test": "node scripts/run-verification.js",
+    "provision": "node scripts/create-vobiz-app-and-endpoint.js",
+    "tunnel": "node scripts/tunnel.js",
+    "test:outbound": "node scripts/test-clickup-sync.js --mock-outbound",
+    "test:inbound": "node scripts/test-clickup-sync.js --mock-inbound",
+    "test:sync": "node scripts/test-clickup-sync.js --sync-cdrs",
+    "test:recording": "node scripts/test-clickup-sync.js --test-recording",
+    "fetch-cdr": "node scripts/fetch-cdr.js --sync"
+  },
+  "keywords": [
+    "vobiz",
+    "clickup",
+    "voip",
+    "cdr",
+    "recording",
+    "telephony",
+    "integration"
+  ],
+  "author": "Vobiz Team",
+  "license": "MIT"
+}
