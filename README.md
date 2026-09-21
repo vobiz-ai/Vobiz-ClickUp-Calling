@@ -4,7 +4,7 @@ A WebRTC softphone that logs calls into ClickUp. Agents dial from the softphone,
 talk in the browser, and each completed call becomes a ClickUp task carrying the
 CDR and a playable recording link.
 
-[Quick start](docs/QUICKSTART.md) · [Architecture](#the-one-thing-to-understand-first) · [Troubleshooting](docs/TROUBLESHOOTING.md) · [Issues](ISSUES.md) · [Listing](MARKETPLACE.md)
+[Docs](https://docs.vobiz.ai/integrations/clickup) · [Quick start](docs/QUICKSTART.md) · [Architecture](#the-one-thing-to-understand-first) · [Troubleshooting](docs/TROUBLESHOOTING.md) · [Issues](ISSUES.md) · [Listing](MARKETPLACE.md)
 
 **Status.** `npm test` starts its own backend and runs 63 assertions across the
 call flows, the ClickUp task shape and a security-regression group that holds
