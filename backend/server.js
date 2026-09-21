@@ -242,9 +242,9 @@ function verifyRecordingSignature(recordingId, exp, sig) {
 }
 
 // ─── CORS and Helpers ───────────────────────────────────────────────────────
-// Origins allowed to drive this backend. A wildcard — what this used to send —
-// lets any page on the internet place calls billed to the account and read the
-// call data this server exposes.
+// Origins allowed to drive this backend. A wildcard would let any page on the
+// internet place calls billed to the account and read the call data this server
+// exposes.
 const ORIGIN_ALLOWLIST = [
   /^https:\/\/([a-z0-9-]+\.)*clickup\.com$/i,
   /^https?:\/\/localhost(:\d+)?$/i,
@@ -536,8 +536,8 @@ const server = http.createServer(async (req, res) => {
     res.end(
       JSON.stringify({
         // Health is unauthenticated, so it reports whether things are
-        // configured, never what they are. It used to publish the account
-        // Auth ID and the SIP username to anyone who asked.
+        // configured, never what they are — publishing the account Auth ID or
+        // the SIP username here would hand them to anyone who asks.
         status: "ok",
         service: "vobiz-clickup-calling",
         publicBaseUrl,
@@ -585,9 +585,9 @@ const server = http.createServer(async (req, res) => {
 
       // Credentials are proven, not assumed.
       //
-      // This route used to issue a session token no matter what was typed: the
-      // numbers lookup below was the only call made, its failure was swallowed,
-      // and sign-in succeeded regardless. Any string signed you in.
+      // The numbers lookup below is not proof: it is allowed to fail, and a
+      // sign-in that treated it as validation would admit anyone who typed
+      // anything.
       let isValid = false;
       if (VOBIZ_AUTH_ID && authId === VOBIZ_AUTH_ID && authToken === VOBIZ_AUTH_TOKEN) {
         isValid = true;
@@ -738,11 +738,11 @@ const server = http.createServer(async (req, res) => {
   // 2c. Session Query Endpoint
   // The bearer token is the only thing that identifies a session.
   //
-  // Two ways in used to bypass it entirely: /session/<agentId> answered from
-  // any live session whose agent id matched, with no token; and a request with
-  // no session at all was answered `loggedIn: true` with the account's Auth ID
-  // whenever the server had credentials configured — which made the whole panel
-  // unauthenticated. The path form is kept so older widgets do not 404.
+  // Two shapes to avoid here: answering /session/<agentId> from any live
+  // session whose agent id matches, and answering a request with no session at
+  // all as `loggedIn: true` because the server happens to have credentials
+  // configured. Either makes the whole panel unauthenticated. The path form is
+  // kept so older widgets do not 404.
   if ((pathname === "/session" || pathname.startsWith("/session/")) && method === "GET") {
     const s = getSession(req);
     if (s) {
@@ -799,10 +799,10 @@ const server = http.createServer(async (req, res) => {
   // 2f. SIP Credentials for Softphone Registration
   // SIP credentials for the softphone to register with.
   //
-  // Behind the session deliberately. SIP credentials let anyone place calls
-  // billed to this account, and this route used to serve them to any caller for
-  // any agent id — `GET /agent/anyone` returned the password in plaintext, with
-  // CORS wide open, falling back to a password hardcoded in this file.
+  // Behind the session deliberately: SIP credentials let anyone place calls
+  // billed to this account. An unknown agent id is refused rather than filled in
+  // with a default, and there is no hardcoded fallback password — a default
+  // password in a published file is a published password.
   if ((pathname === "/api/agent-sip" || pathname === "/agent" || pathname.startsWith("/agent/")) && method === "GET") {
     const s = getSession(req);
     if (!s) {
@@ -1306,18 +1306,17 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 10. GET /recording-file?url=… is gone.
+  // 10. GET /recording-file?url=… is deliberately not implemented, and says so.
   //
-  // It took a fully caller-controlled URL and fetched it with the account's
-  // Vobiz credentials attached. Verified live: pointing it at a listener
-  // returned X-Auth-ID and X-Auth-Token. That is a credential-exfiltration
-  // primitive, not merely SSRF — unauthenticated, and CORS was a wildcard.
-  // The redirect-side header stripping it did have was no defence, because the
-  // very first request already carried the credentials to wherever it was told.
+  // Fetching a caller-supplied URL with the account's Vobiz credentials
+  // attached is a credential-exfiltration primitive, not merely SSRF: it
+  // delivers X-Auth-ID and X-Auth-Token to whatever host the caller names.
+  // Stripping the headers on redirects is no defence — the first request
+  // already carried them wherever it was told to go.
   //
-  // Playback now goes through the signed /recording-audio/<recordingId> above,
-  // which resolves the media URL server-side and refuses any host off the
-  // allowlist, on the first request and again after each redirect.
+  // Playback goes through the signed /recording-audio/<recordingId> above,
+  // which takes an id, resolves the media URL server-side, and refuses any host
+  // off the allowlist, on the first request and again after each redirect.
   if (pathname === "/recording-file" && method === "GET") {
     res.writeHead(410, { "Content-Type": "application/json" });
     res.end(
@@ -1479,11 +1478,11 @@ const server = http.createServer(async (req, res) => {
 
   // Serve only from inside clickup-app/.
   //
-  // `url.parse` does not normalise dot segments, so `GET /../backend/.env`
-  // arrived here intact and path.join walked straight out of the static
-  // directory. Verified live: it returned the .env file, which over the tunnel
-  // is every credential this integration holds. Resolve first, then require the
-  // result to still be inside the static root.
+  // `url.parse` does not normalise dot segments, so a path like
+  // `/../backend/.env` arrives here intact and path.join would walk straight
+  // out of the static directory — over a tunnel, that is every credential this
+  // integration holds. Resolve first, then require the result to still be
+  // inside the static root.
   const staticBase = path.resolve(__dirname, "..", "clickup-app");
   const filePath = path.resolve(staticBase, "." + path.posix.normalize("/" + subPath));
 

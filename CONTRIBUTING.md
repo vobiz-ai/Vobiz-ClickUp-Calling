@@ -19,15 +19,13 @@ npm test                                # starts its own backend and asserts
 ## Rules that are not style preferences
 
 **Never commit a credential.** `backend/.env` is gitignored. `agents.json` is
-committed, so it holds names and SIP usernames only. There is no hardcoded
-fallback password in this codebase — there was, and it was a published
-credential.
+committed, so it holds names and SIP usernames only. There is no fallback
+password in this codebase, and adding one publishes it.
 
 **Never fetch a caller-supplied URL with credentials attached.** If you need a
 new media endpoint, take an id, resolve the URL server-side, and check it
 against `MEDIA_HOST_ALLOWLIST` — before the request and again after every
-redirect. This is the defect that has recurred most across the Vobiz CRM
-integrations.
+redirect.
 
 **Static paths are normalised and confined.** `url.parse` does not collapse dot
 segments. If you touch the static handler, keep the `path.resolve` + prefix
@@ -37,10 +35,10 @@ written with it passes against a vulnerable server.
 **A new route that spends money, changes configuration, or reads call data
 starts with `if (!requireSession(req, res)) return;`.** The default is closed.
 
-**A test that cannot fail is worse than no test.** This suite once signed in
-with `MA_TEST_AUTH_ID` and asserted the 200 as a pass, which made an
-authentication bypass look like correct behaviour. Assert on the thing that
-would break, and exit non-zero.
+**A test that cannot fail is worse than no test.** A suite that signs in with a
+made-up id and asserts the 200 as a pass makes an authentication bypass look
+like correct behaviour. Assert on the thing that would break, and exit
+non-zero.
 
 **Do not reintroduce wildcard CORS.** Add the origin to `ORIGIN_ALLOWLIST` or
 set `ALLOWED_ORIGINS`.

@@ -4,13 +4,7 @@ A WebRTC softphone that logs calls into ClickUp. Agents dial from the softphone,
 talk in the browser, and each completed call becomes a ClickUp task carrying the
 CDR and a playable recording link.
 
-[Docs](https://docs.vobiz.ai/integrations/clickup) · [Quick start](docs/QUICKSTART.md) · [Architecture](#the-one-thing-to-understand-first) · [Troubleshooting](docs/TROUBLESHOOTING.md) · [Issues](ISSUES.md) · [Listing](MARKETPLACE.md)
-
-**Status.** `npm test` starts its own backend and runs 63 assertions across the
-call flows, the ClickUp task shape and a security-regression group that holds
-the fixes in [CHANGELOG 2.0.0](CHANGELOG.md) in place. A live call against a
-production Vobiz account has not been run since those fixes; see
-[ISSUES.md](ISSUES.md#1-no-live-call-since-the-security-rewrite).
+[Docs](https://docs.vobiz.ai/integrations/clickup) · [Quick start](docs/QUICKSTART.md) · [Architecture](#the-one-thing-to-understand-first) · [Troubleshooting](docs/TROUBLESHOOTING.md)
 
 ---
 
@@ -46,10 +40,9 @@ endpoint, and it works.
 | `scripts/create-vobiz-app-and-endpoint.js` | Provisions the Vobiz application and SIP endpoint |
 | `scripts/fetch-cdr.js` | Pulls recent CDRs and syncs them to ClickUp from the command line |
 
-ClickUp is written through its REST API with a personal token — there is no
-OAuth app and no iframe integration. The softphone is a page you open beside
-ClickUp, not a ClickUp extension. That is the single biggest gap between this
-and a listable app; see [MARKETPLACE.md](MARKETPLACE.md).
+ClickUp is written through its REST API with a personal token. The softphone is
+a page served by the backend that you open beside ClickUp, rather than an
+extension inside it — so there is nothing to install into your workspace.
 
 ---
 
@@ -133,33 +126,37 @@ the call connected. Empty means no B leg was ever created, whatever the UI said.
 
 ## Security
 
-Every item below was a live, reproduced defect in this repository before 2.0.0.
-Do not reintroduce them.
+This service holds your Vobiz Auth Token, a SIP endpoint password and a ClickUp
+API token, and it is reachable from the internet because Vobiz has to call its
+webhooks. It is built accordingly.
 
-- **Static files are confined to `clickup-app/`.** `GET /../backend/.env` used
-  to return the file — over a tunnel, every credential this service holds.
+- **Static files are confined to `clickup-app/`**, so no request can reach a
+  path outside it.
 - **Recording playback is HMAC-signed with a short expiry**, takes a recording
   *id*, resolves the media URL server-side, and refuses any host off an
-  allowlist. Never reintroduce a caller-supplied URL here: with account
-  credentials attached, that is a credential-exfiltration primitive.
-- **Sign-in proves the credentials** against Vobiz. It used to issue a session
-  for any string typed into the form.
-- **A request without a token is not a session.** `/session` used to answer
-  `loggedIn: true` with the account Auth ID whenever the server was configured.
-- **SIP credentials are session-gated**, and there is no hardcoded fallback
-  password in the source.
+  allowlist. Never add a caller-supplied URL here: with account credentials
+  attached, that hands them to whatever host is named.
+- **Sign-in proves the credentials** against Vobiz, and a request with no token
+  is not a session.
+- **SIP credentials are session-gated**, with no default password anywhere in
+  the source.
 - **Placing a call requires a session**, and credentials are never read from the
   request body.
 - **CORS is an allowlist** — `*.clickup.com`, localhost, `ALLOWED_ORIGINS`.
 
-Report a vulnerability to `support@vobiz.ai` — see [SECURITY.md](SECURITY.md).
+Two things to get right before you go live: set `SIGNING_SECRET` explicitly, or
+playback links in ClickUp tasks stop working at every restart, and give the
+integration a ClickUp user with access to the call list only — a personal token
+carries everything its owner can reach.
+
+Found a problem? `support@vobiz.ai` — see [SECURITY.md](SECURITY.md).
 
 ---
 
 ## Tests
 
 ```bash
-npm test                 # starts its own backend, 63 assertions, exits non-zero on failure
+npm test                 # starts its own backend, exits non-zero on failure
 npm run test:outbound    # drives a simulated outbound call into ClickUp
 npm run test:inbound
 npm run test:sync        # CDR sync

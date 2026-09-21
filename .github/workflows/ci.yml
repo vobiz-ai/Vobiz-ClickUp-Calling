@@ -23,9 +23,8 @@ jobs:
           node-version: ${{ matrix.node-version }}
 
       # The suite starts its own backend, points the Vobiz API at a closed port
-      # so nothing can place a call, and exits non-zero on any failure —
-      # including the security regressions. It replaced a job that only checked
-      # syntax and that some documentation files existed.
+      # so nothing can place a call, and exits non-zero on any failure,
+      # including the security properties.
       - name: Test suite
         run: npm test
 
@@ -34,9 +33,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # A credential in a public repository is a published credential. These
-      # patterns are the shapes that have actually been committed to Vobiz
-      # integrations before.
+      # A credential in a public repository is a published credential.
       - name: No committed credentials
         run: |
           set -e
@@ -44,14 +41,14 @@ jobs:
           if grep -rIn '"sipPassword"' --include='*.json' . ; then
             echo "agents.json is committed; it must not carry a SIP password field"; exit 1
           fi
-          # Scoped to the shipped code: the regression test in scripts/ names
-          # the old hardcoded password on purpose, to assert its absence.
+          # Scoped to the shipped code: the suite in scripts/ names the
+          # pattern on purpose, to assert its absence.
           if grep -rInE 'ClickUpAgent#|pk_[0-9]{6,}_' --include='*.js' --include='*.json' backend/ clickup-app/ ; then
             echo "a hardcoded credential must not come back"; exit 1
           fi
-          # The defect was a media fetch whose destination came from the
-          # request. Match that, not the word "recording-file" — the removal
-          # notice and its regression test both mention it by name.
+          # Matches a media fetch whose destination comes from the request,
+          # rather than the words "recording-file" — the API note and its test
+          # both mention that by name.
           if grep -rInE 'query\.url' --include='*.js' backend/ ; then
             echo "a caller-supplied media URL must not come back"; exit 1
           fi

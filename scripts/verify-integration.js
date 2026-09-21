@@ -83,9 +83,9 @@ async function runTests() {
   // 2. Dual Login: Mode 1 (Account Login) & Mode 2 (SIP Direct)
   console.log("\n[2/8] Testing Dual Login APIs...");
 
-  // Regression: this suite used to sign in with "MA_TEST_AUTH_ID" and assert
-  // the 200 as a pass — codifying an authentication bypass as correct
-  // behaviour. Credentials that Vobiz has not accepted must be refused.
+  // Credentials Vobiz has not accepted must be refused. A suite that signs in
+  // with a made-up id and asserts the 200 as a pass would call an
+  // authentication bypass correct behaviour.
   const badLogin = await request("/login", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -129,7 +129,7 @@ async function runTests() {
   assert(sipLoginRes.json.callerId === TEST_FROM_NUMBER, "POST /login-sip registers direct caller ID");
   assert(Boolean(sipLoginRes.json.token), "POST /login-sip returns a SIP-scoped session token");
 
-  // Regression: an arbitrary caller ID is caller-ID spoofing on the account.
+  // An arbitrary caller ID is caller-ID spoofing on the account.
   const spoof = await request("/login-sip", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -137,10 +137,8 @@ async function runTests() {
   });
   assert(spoof.status === 400, "POST /login-sip refuses a caller ID the account does not own");
 
-  // SIP Credentials for Softphone UA — behind the session.
-  //
-  // Regression: `GET /agent/anyone` used to return the SIP password in
-  // plaintext to an unauthenticated caller.
+  // SIP Credentials for Softphone UA — behind the session. An unauthenticated
+  // caller is never shown a SIP password, whatever agent id they name.
   const agentSipAnon = await request("/agent/anyone");
   assert(agentSipAnon.status === 401, "GET /agent/<anyone> refuses an unauthenticated caller");
   assert(!agentSipAnon.text.includes("sipPassword"), "an unauthenticated caller is never shown a SIP password");
@@ -260,15 +258,15 @@ async function runTests() {
   const styleCss = await request("/clickup-app/style.css");
   assert(styleCss.status === 200 && styleCss.text.includes(".call-done-modal-backdrop"), "GET /clickup-app/style.css serves Zendesk design stylesheet");
 
-  // 9. Security regressions
+  // 9. Security properties
   //
-  // Each of these was exploitable against the running server. They are
-  // permanent: if any starts passing traffic again, the suite fails.
-  console.log("\n[9/9] Security regressions...");
+  // Each of these is a guarantee this backend makes. They are permanent: if any
+  // stops holding, the suite fails.
+  console.log("\n[9/9] Security properties...");
 
-  // Path traversal. `url.parse` does not normalise dot segments, so
-  // `GET /../backend/.env` walked straight out of the static directory and
-  // returned the file — every credential this integration holds.
+  // Path traversal. `url.parse` does not normalise dot segments, so a path
+  // like `/../backend/.env` reaches the static handler intact — and the file it
+  // names holds every credential this integration has.
   const traversal = await rawRequest("/../backend/.env.example");
   assert(traversal.status === 403 || traversal.status === 404, "static serving must refuse ../ traversal");
   assert(!traversal.text.includes("VOBIZ_AUTH_TOKEN"), "traversal must never return backend files");
@@ -284,10 +282,10 @@ async function runTests() {
   assert(traversalDeep.status === 403 || traversalDeep.status === 404, "static serving must refuse absolute escapes");
   assert(!traversalDeep.text.includes("root:"), "traversal must never reach files outside the repo");
 
-  // The credential-exfiltration proxy: it fetched any URL a caller named with
-  // X-Auth-ID and X-Auth-Token attached.
+  // A media proxy that fetches a caller-supplied URL with X-Auth-ID and
+  // X-Auth-Token attached hands them to whatever host is named.
   const exfil = await request(`/recording-file?url=${encodeURIComponent("http://127.0.0.1:1/steal")}`);
-  assert(exfil.status === 410, "/recording-file?url= must be gone, not merely guarded");
+  assert(exfil.status === 410, "/recording-file?url= is not implemented, not merely guarded");
 
   // Playback signatures must actually be checked.
   const unsigned = await request("/recording-audio/rec_123");
@@ -295,8 +293,8 @@ async function runTests() {
   const forged = await request("/recording-audio/rec_123?exp=99999999999&sig=deadbeef");
   assert(forged.status === 403, "/recording-audio must reject a forged signature");
 
-  // A request with no token used to be answered `loggedIn: true` with the
-  // account's Auth ID, which made the whole panel unauthenticated.
+  // A request with no token is not a session. Answering one `loggedIn: true`
+  // with the account's Auth ID would make the whole panel unauthenticated.
   const anonSession = await request("/session");
   assert(anonSession.json && anonSession.json.loggedIn === false, "GET /session without a token is not logged in");
   assert(!anonSession.text.includes(TEST_AUTH_ID), "GET /session must not leak the account Auth ID");
@@ -331,7 +329,7 @@ async function runTests() {
     "an unknown origin must not be echoed back as allowed"
   );
 
-  // A password hardcoded in server.js is a published password.
+  // A default password in a published file is a published password.
   const serverSrc = fs.readFileSync(path.join(__dirname, "..", "backend", "server.js"), "utf8");
   assert(!serverSrc.includes("ClickUpAgent#2026!"), "no hardcoded SIP password may remain in server.js");
 

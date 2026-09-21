@@ -2,9 +2,9 @@
  * Starts a backend with test configuration, runs verify-integration.js against
  * it, and exits with that suite's status.
  *
- * The suite used to require someone to have started a server by hand on port
- * 8092 — so in CI it either tested whatever happened to be running or nothing
- * at all. It now owns the server it tests.
+ * The suite owns the server it tests, rather than expecting one to have been
+ * started by hand — otherwise CI tests whatever happens to be running, or
+ * nothing at all.
  *
  * VOBIZ_API_URL points at a closed port on purpose: no test may reach the real
  * Vobiz API, place a call, or spend money.

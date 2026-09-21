@@ -27,8 +27,8 @@ The status badge is the SIP registration, not the backend connection.
   which requires a session. If sign-in failed, registration never starts — look
   for `401` in the browser console.
 - **`VOBIZ_SIP_USER / VOBIZ_SIP_PASSWORD are not configured on this server`** —
-  exactly what it says. The backend will not invent a password; the hardcoded
-  fallback it used to have was a published credential.
+  exactly what it says. The backend will not invent a password, because a
+  default password in a published file is a published password.
 - **SIP-direct mode**: the password is proven by the REGISTER itself, so a wrong
   one shows as "not Ready" with no sign-in error.
 - Microphone permission must be granted **before** registration, and the page
@@ -121,9 +121,9 @@ Re-open the recording from the softphone's history for a fresh link.
 
 ## `/recording-file` returns HTTP 410
 
-Deliberate. That endpoint took a caller-supplied URL and fetched it with the
-account credentials attached; it was removed. Use the signed
-`/recording-audio/<recordingId>` link.
+Deliberate: this backend does not proxy a caller-supplied URL, because doing so
+with the account credentials attached would hand them to whatever host is named.
+Use the signed `/recording-audio/<recordingId>` link.
 
 ---
 

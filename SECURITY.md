@@ -27,15 +27,14 @@ reach `/answer`. Treat any endpoint on it as internet-facing, because it is.
 
 ## Rules this codebase follows
 
-These are not aspirations. Each one replaced a defect that was reproduced
-against the running server; the test suite fails if any is undone.
+These are enforced by the test suite, which fails if any is undone.
 
 **Static serving cannot leave `clickup-app/`.** Paths are normalised and the
 resolved path is required to stay inside the static root. `url.parse` does not
-collapse dot segments, so `GET /../backend/.env` used to arrive intact and be
-served — the whole `.env`, over the public tunnel. Note that `fetch()`
-normalises `/../` before sending, so a test written with it cannot catch this;
-the suite uses a raw socket.
+collapse dot segments, so a path like `/../backend/.env` reaches the handler
+intact and would otherwise be served — the whole `.env`, over the public tunnel.
+Note that `fetch()` normalises `/../` before sending, so a test written with it
+cannot catch this; the suite uses a raw socket.
 
 **No credential ever leaves on a caller's instruction.** The recording proxy
 takes a recording *id*, resolves the media URL server-side, and refuses any host
@@ -70,8 +69,5 @@ whether things are configured, not what they are.
   reach; a dedicated integration user with access to only the call list is the
   smaller blast radius.
 - Keep `backend/.env` out of git. It is gitignored; check before you force-add.
-- Rotate the Vobiz Auth Token, the SIP password and the ClickUp token if this
-  service has ever run a version older than 2.0.0 on a public tunnel. The
-  defects above were remotely exploitable without authentication.
 - Remember that call tasks are readable by everyone in the ClickUp space,
   including the customer's number and the recording link.
