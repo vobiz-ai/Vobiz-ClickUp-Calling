@@ -6,6 +6,21 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [2.1.0] - Unreleased
 
+### Fixed
+- **Agent profiles come from the backend.** The panel no longer hard-codes
+  `admin` / `agent1`: the agent ID is free text, with the profiles in
+  `agents.json` (via the new `GET /api/agent-profiles`, id and name only) as
+  suggestions. `agents.json` is optional and no longer committed; copy
+  `agents.example.json`. Sign-in requires an agent ID instead of defaulting to
+  `admin`.
+- **Call tasks are assigned** to the agent's `clickUpUserId` from `agents.json`,
+  when there is one; a refused assignee falls back to an unassigned task.
+- **Sync CDRs is idempotent.** It skips calls that already have a task (tracked
+  in `DATA_DIR/synced-calls.json`, and by call UUID on the list), runs one sync
+  per account at a time, and adds the recording link when Vobiz has one.
+- **The softphone uses the configured `VOBIZ_REGISTRAR`** for SIP Direct
+  registration and for dial targets, instead of a hard-coded host.
+
 ### Changed — any Vobiz account can sign in
 - **Nothing account-specific is configured on the server.** `VOBIZ_AUTH_ID`,
   `VOBIZ_AUTH_TOKEN`, `VOBIZ_FROM_NUMBER`, `VOBIZ_SIP_USER` and
@@ -33,6 +48,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   link cannot fetch another's audio.
 
 ### Removed
+- The **Transfer** button: it only showed an alert and transferred nothing.
 - `scripts/create-vobiz-app-and-endpoint.js` (`npm run provision`) — sign-in
   provisions now.
 - `scripts/fetch-cdr.js` and `scripts/test-clickup-sync.js` (`npm run fetch-cdr`,

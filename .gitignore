@@ -14,3 +14,6 @@ cloudflared.exe
 
 # Per-sign-in endpoint map (account:agent -> endpoint id, username). No secrets, but account-specific.
 backend/data/
+
+# Optional agent profiles (copy agents.example.json); deployment-specific
+backend/agents.json

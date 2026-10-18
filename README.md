@@ -25,7 +25,8 @@ connects the softphone, Vobiz and ClickUp.
 - **Multiple agents:** each agent gets their own SIP endpoint in your account.
 - **Two ways to sign in:** with your Vobiz account (Auth ID and Auth Token), or
   with an existing SIP endpoint's username and password.
-- **Sync CDRs** pulls your account's most recent call records into ClickUp.
+- **Sync CDRs** pulls your account's most recent call records into ClickUp,
+  skipping calls that already have a task.
 - In-call **mute**, **hold** and a **keypad** for tones (DTMF).
 
 ---
@@ -149,7 +150,8 @@ The panel has two tabs. Use **Vobiz account** unless you have a reason not to.
 1. Open the **Vobiz account** tab.
 2. Enter your **Auth ID** (`MA_XXXXXXXX`) and **Auth Token** from Console →
    API credentials. The Auth Token is not your Console login password.
-3. Pick your **ClickUp Agent Profile** and click **Log in**.
+3. Enter your **Agent ID** (pick one of the suggestions, or type your own) and
+   click **Log in**.
 
 The backend checks the credentials with Vobiz, then sets up your account
 automatically:
@@ -159,7 +161,7 @@ automatically:
   `https://calling.example.com/hangup-callback`. If your account already has an
   application with exactly that answer URL, it is reused. Applications this
   integration did not create are never changed.
-- **One SIP endpoint per agent profile**, with the alias `ClickUp-<profile>`,
+- **One SIP endpoint per agent ID**, with the alias `ClickUp-<agent ID>`,
   attached to that application. The endpoint is reused on later sign-ins, and
   each sign-in gives it a new random SIP password that only that browser session
   receives.
@@ -230,30 +232,28 @@ curl -X POST "https://api.vobiz.ai/api/v1/Account/$AUTH_ID/numbers/%2B91XXXXXXXX
 calls**, the recordings list and playback, the ClickUp task lookup during calls,
 and **Sync CDRs**. Calls are still logged to ClickUp, without a recording link.
 
-### Agent profiles
+### Agent IDs and profiles
 
-The **ClickUp Agent Profile** dropdown decides which SIP endpoint an agent uses
-and which name appears on their call tasks. It ships with two profiles,
-`admin` and `agent1`. Each agent who is signed in at the same time needs their
-own profile: signing in with a profile that is already in use signs the other
-browser out.
+The **Agent ID** decides which SIP endpoint an agent uses and which name
+appears on their call tasks. It is 1 to 30 letters, digits, `-` or `_`. Each
+agent who is signed in at the same time needs their own agent ID: signing in
+with one that is already in use signs the other browser out.
 
-To add profiles, add an entry to `backend/agents.json`:
+Agent profiles are optional. To have the panel suggest agent IDs, show a name on
+tasks, and assign each agent's tasks to them in ClickUp, copy
+`backend/agents.example.json` to `backend/agents.json` and edit it:
 
 ```json
 {
-  "admin":  { "name": "System Administrator" },
-  "agent1": { "name": "John Doe" },
-  "priya":  { "name": "Priya Sharma" }
+  "priya": { "name": "Priya Sharma", "clickUpUserId": "81234567" }
 }
 ```
 
-and add a matching option to the `loginAgentSelect` dropdown in
-`clickup-app/index.html`:
-
-```html
-<option value="priya">Priya Sharma (priya)</option>
-```
+The panel reads the list from the backend (`GET /api/agent-profiles`, which
+returns only IDs and names), so there is nothing to change in the page.
+`clickUpUserId` is the agent's numeric ClickUp user ID; without it, that agent's
+tasks are not assigned. An agent ID that is not in the file still works: its
+tasks show the ID and are not assigned.
 
 ---
 
@@ -300,7 +300,11 @@ Every call your backend answers creates **one task** in the list set by
 
 The task is created when Vobiz reports the call result. When the recording is
 ready, the same task is updated with the playback link. Tasks are created by
-the ClickUp user who owns the API token, and they are not assigned to anyone.
+the ClickUp user who owns the API token. When the agent's profile in
+`agents.json` has a `clickUpUserId`, the task is assigned to that user;
+otherwise it is not assigned. If ClickUp refuses the user ID (for example, the
+user is not in the workspace), the task is created unassigned and the backend
+logs a warning.
 
 The caller lookup during a call searches the same list for a task whose name or
 description contains the customer's number, so tasks this integration created
@@ -321,9 +325,13 @@ reloads the list.
 
 The **Sync CDRs** button (next to refresh in **Call recordings & CDRs**) fetches
 the five most recent call records from your Vobiz account and creates a ClickUp
-task for each one. Use it to backfill calls made outside the softphone. Each
-click creates new tasks, even for calls that are already in ClickUp. These tasks
-carry no recording link.
+task for each call that does not have one yet. Use it to backfill calls made
+outside the softphone. It is safe to click more than once: calls already logged
+by the softphone, by an earlier sync, or by a task in the list whose description
+contains the call UUID are skipped. The panel log says how many tasks were
+created and how many calls were skipped. When Vobiz has a recording for the
+call, the task gets the same signed playback link as any other call. Tasks for
+calls the backend did not handle itself are not assigned.
 
 ---
 
@@ -337,7 +345,8 @@ settings the backend reads.
 | `PUBLIC_BASE_URL` | Yes, in production | URL in `backend/tunnel-url.txt`, else the address the browser used | Your backend's public HTTPS address, such as `https://calling.example.com`. It becomes the answer URL of the Vobiz application and the base of recording links. |
 | `TUNNEL_URL` | No | none | Used in place of `PUBLIC_BASE_URL` when that is not set. |
 | `PORT` | No | `8092` | Port the backend listens on. `npm run tunnel` uses it too. |
-| `DATA_DIR` | No | `backend/data` | Folder for `endpoints.json`, the map of agent profiles to SIP endpoints. Holds no passwords or tokens. |
+| `DATA_DIR` | No | `backend/data` | Folder for `endpoints.json`, the map of agent IDs to SIP endpoints, and `synced-calls.json`, the call UUIDs that already have a ClickUp task. Holds no passwords or tokens. |
+| `AGENTS_FILE` | No | `backend/agents.json` | Optional agent profiles: names, and the ClickUp user to assign each agent's tasks to. See [Agent IDs and profiles](#agent-ids-and-profiles). |
 | `CLICKUP_API_TOKEN` | Yes, to log calls | none | Personal API token (`pk_...`) of the ClickUp user that creates the tasks. |
 | `CLICKUP_LIST_ID` | Yes, to log calls | none | ID of the ClickUp list that receives call tasks. |
 | `CLICKUP_TASK_STATUS` | No | the list's default status | Status for new call tasks. It must be a status the list defines, or ClickUp rejects the task. |
@@ -346,7 +355,7 @@ settings the backend reads.
 | `RECORDING_URL_TTL_SECONDS` | No | `900` | How long a recording link works, in seconds. |
 | `ALLOWED_ORIGINS` | No | none | Extra browser origins allowed to call the backend, comma-separated. The softphone page itself, `*.clickup.com` and `localhost` are always allowed. |
 | `VOBIZ_API_URL` | No | `https://api.vobiz.ai` | Vobiz API address. Leave as is. |
-| `VOBIZ_REGISTRAR` | No | `registrar.vobiz.ai` | Vobiz SIP registrar. Leave as is. |
+| `VOBIZ_REGISTRAR` | No | `registrar.vobiz.ai` | Vobiz SIP registrar. The softphone uses it for registration and dialling in both sign-in modes. Leave as is. |
 
 If `CLICKUP_API_TOKEN` or `CLICKUP_LIST_ID` is missing, calls still work, but no
 tasks are created. The backend logs `ClickUp token not set` for each call
@@ -365,7 +374,7 @@ instead.
   backend's memory, so two instances behind a load balancer would each miss the
   other's calls.
 - **Keep `DATA_DIR` on persistent storage.** If it is lost, agents' endpoints are
-  found again by their `ClickUp-<profile>` alias, so this is not fatal, but a
+  found again by their `ClickUp-<agent ID>` alias, so this is not fatal, but a
   persistent folder keeps sign-in fast.
 - **Set `SIGNING_SECRET`** to a long random value and keep it the same across
   restarts and deploys.
@@ -390,10 +399,11 @@ instead.
   given only to the signed-in browser session. With SIP direct, the password
   stays in the browser.
 - **What is stored on disk:** `DATA_DIR/endpoints.json`, mapping each account
-  and agent profile to an endpoint ID and SIP username, with file mode `0600`.
-  No passwords, no tokens.
+  and agent ID to an endpoint ID and SIP username, and
+  `DATA_DIR/synced-calls.json`, the call UUIDs per account that already have a
+  ClickUp task. Both have file mode `0600`. No passwords, no tokens.
 - **What the browser keeps:** a session token (valid for 24 hours), the Auth ID,
-  the agent profile and the numbers list, in local storage. With **Remember
+  the agent ID and the numbers list, in local storage. With **Remember
   these**, also the SIP username and caller ID.
 - **Each session sees only its own account.** Numbers, recordings, call records
   and caller IDs are all limited to the Vobiz account that signed in.
@@ -422,7 +432,7 @@ To report a vulnerability, email `support@vobiz.ai`. See [SECURITY.md](SECURITY.
 | "Invalid Vobiz Auth ID or Auth Token." | Vobiz refused the credentials. | Copy both again from Console → API credentials. The Auth Token is not your login password. |
 | "Could not reach Vobiz to check those credentials." | The backend cannot reach `api.vobiz.ai`. | Allow outbound HTTPS from the server, and leave `VOBIZ_API_URL` unset. |
 | "Signed in to Vobiz, but setting up the softphone failed" | Vobiz refused to create the application or the endpoint. | The backend log line starting `[provision]` gives the reason. Check that the account is active. |
-| The badge reads **OFFLINE** and the status line says **Not registered** | The agent profile was signed in from another tab or browser, which replaced this one's SIP password, or (SIP direct) the username or password is wrong. | Sign out and sign in again. Give each agent their own profile. On SIP direct, check the endpoint's credentials. |
+| The badge reads **OFFLINE** and the status line says **Not registered** | The agent ID was signed in from another tab or browser, which replaced this one's SIP password, or (SIP direct) the username or password is wrong. | Sign out and sign in again. Give each agent their own agent ID. On SIP direct, check the endpoint's credentials. |
 | The badge never gets past **REGISTERING** | No microphone access, or the page is not on HTTPS. | Open the softphone at its `https://` address, allow the microphone, and reload. |
 | Calls stopped working after the server address changed | Your Vobiz application still points to the old answer URL. | Set `PUBLIC_BASE_URL`, restart, sign in again, and click **Enable inbound calls** again. |
 | Calls fail although `/answer` works | `PUBLIC_BASE_URL` was not set when you signed in, so the application was created with the address you opened the page on, such as `http://localhost:8092`. | Set `PUBLIC_BASE_URL`, restart, and sign in again. |
@@ -432,6 +442,7 @@ To report a vulnerability, email `support@vobiz.ai`. See [SECURITY.md](SECURITY.
 | "This account has no phone number to call from" | The account has no active, voice-enabled number. | Add a number in the Vobiz Console, then sign in again. |
 | No task appears in ClickUp | Token or list not set, the token's user cannot write to the list, or `CLICKUP_TASK_STATUS` is not a status of that list. | Check the backend log for `[ClickUp] API error` or `ClickUp token not set`, and fix the setting it names. |
 | A recording link in a task says "Invalid or expired playback signature" | The link is older than `RECORDING_URL_TTL_SECONDS`, or `SIGNING_SECRET` changed since it was made. | Play the recording from the softphone's recordings list, which always makes a fresh link. Set a fixed `SIGNING_SECRET`. |
+| Call tasks are not assigned to the agent | The agent ID has no `clickUpUserId` in `agents.json`, or ClickUp refused it (the backend logs `ClickUp refused assignee`). | Add the agent's numeric ClickUp user ID to their profile, and check that the user is in the workspace. |
 | A recording says "Sign in again, then retry" | The backend restarted and no one from that account has signed in since. | Sign in, then play it again. |
 | "Sign in first" errors in the browser | The session expired (after 24 hours) or the backend restarted. | Sign in again. |
 
@@ -448,18 +459,16 @@ To report a vulnerability, email `support@vobiz.ai`. See [SECURITY.md](SECURITY.
 - **SIP direct** has no caller ID dropdown, inbound enabling, recordings, task
   lookup or CDR sync, and its ClickUp tasks have no recording link.
 - **Every call is recorded.** There is no setting to turn recording off.
-- **Tasks are created by one ClickUp user** (the token owner) and are not
-  assigned to the agent.
+- **Tasks are created by one ClickUp user** (the token owner). They are assigned
+  to the agent only when the agent's profile has a `clickUpUserId`.
 - **Task status is fixed:** one status for all call tasks, not one per call
   outcome.
 - **The caller lookup** reads the first 100 tasks in the list (open and closed)
   and matches the number's digits in the task name or description.
-- **Sync CDRs** imports the five most recent calls and creates duplicate tasks
-  if you run it twice.
-- **The Transfer button does not transfer calls.** It only asks for a number and
-  shows a message.
-- **Agent profiles** are defined in `backend/agents.json` and in the dropdown in
-  `clickup-app/index.html`, and two browsers cannot share one profile.
+- **Sync CDRs** looks at the five most recent calls only. Its check for an
+  existing task reads the first 100 tasks in the list.
+- **No call transfer.** The softphone has no transfer feature.
+- **Two browsers cannot share one agent ID.**
 - **Not a ClickUp app.** The softphone runs in its own browser tab, not inside
   ClickUp.
 
@@ -480,7 +489,7 @@ committed. There is no separate lint step.
 backend/
   server.js            the backend: sign-in, Vobiz webhooks, ClickUp tasks, recordings, static files
   .env.example         configuration template
-  agents.json          agent profiles (display names)
+  agents.example.json  example agent profiles; copy to agents.json (optional, not committed)
 clickup-app/
   index.html           the softphone page
   softphone.js         sign-in, dialer, call states, ClickUp task card, recordings
