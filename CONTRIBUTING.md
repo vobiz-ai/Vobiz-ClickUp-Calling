@@ -18,9 +18,9 @@ npm test                                # starts its own backend and asserts
 
 ## Rules that are not style preferences
 
-**Never commit a credential.** `backend/.env` is gitignored. `agents.json` is
-committed, so it holds names and SIP usernames only. There is no fallback
-password in this codebase, and adding one publishes it.
+**Never commit a credential.** `backend/.env` and `backend/data/` are
+gitignored. `agents.json` is committed, so it holds display names only. There is
+no fallback password in this codebase, and adding one publishes it.
 
 **Never fetch a caller-supplied URL with credentials attached.** If you need a
 new media endpoint, take an id, resolve the URL server-side, and check it
@@ -59,10 +59,10 @@ told the agent could not be reached.
 
 1. Branch from `main`.
 2. `npm test` must pass, and new behaviour needs an assertion.
-3. Describe what you verified and how — "ran the suite" and "placed a live call
-   to +91…, two-way audio, `DialBLegUUID` present" are different claims, and the
-   second is the one that matters for anything touching call flow.
-4. Update `CHANGELOG.md` for anything user-visible, and the docs if you close
+3. Describe what you verified and how — "ran the suite" and "placed a live call,
+   two-way audio, `DialBLegUUID` present" are different claims, and the second is
+   the one that matters for anything touching call flow.
+4. Update `CHANGELOG.md` for anything user-visible, and the README if you close
    or discover a limitation.
 
 ## Reporting a vulnerability
