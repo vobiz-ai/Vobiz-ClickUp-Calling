@@ -11,3 +11,6 @@ scripts/tunnel-url.txt
 backend/cloudflared.exe
 cloudflared
 cloudflared.exe
+
+# Per-sign-in endpoint map (account:agent -> endpoint id, username). No secrets, but account-specific.
+backend/data/

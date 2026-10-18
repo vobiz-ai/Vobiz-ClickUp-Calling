@@ -1,9 +1,12 @@
 /** === Vobiz Calling for ClickUp — Softphone Logic ===
  *
  * Supports:
- * 1. Dual login:
- *    - Mode 1: Vobiz account (Auth ID & Auth Token) -> fetches numbers, generates session.
- *    - Mode 2: SIP direct (SIP username, SIP password & Outbound Caller ID).
+ * 1. Two ways to sign in, neither needing anything configured on the server:
+ *    - Vobiz account (Auth ID & Auth Token), any account. The backend checks the
+ *      pair with Vobiz, provisions this agent's SIP endpoint in that account,
+ *      and returns the account's numbers. The Auth Token never comes back.
+ *    - SIP Direct: an existing endpoint's SIP username & password (registered
+ *      straight from the browser, never sent to the backend) plus a caller ID.
  * 2. Incoming call popup banner with Web Audio ringtone & Accept/Decline keyboard shortcuts.
  * 3. Inbound call completed notification popup modal + native HTML5 desktop notification.
  * 4. Outbound WebRTC calling with custom caller ID headers, DTMF keypad, live timer, mute, hold, transfer.
@@ -30,12 +33,20 @@ document.addEventListener("DOMContentLoaded", () => {
   const acceptBtn = document.getElementById("acceptbtn");
   const declineBtn = document.getElementById("declinebtn");
 
-  // Dual Login Tabs & Panels
+  // Sign-in Tabs & Panels
   const modeAccountTab = document.getElementById("mode-account-tab");
   const modeSipTab = document.getElementById("mode-sip-tab");
   const modeAccountPanel = document.getElementById("mode-account");
   const modeSipPanel = document.getElementById("mode-sip");
   const stepCallerId = document.getElementById("step-caller-id");
+  const sipModeNote = document.getElementById("sip-mode-note");
+
+  // SIP Direct Form
+  const sipUserInput = document.getElementById("sip-username");
+  const sipPassInput = document.getElementById("sip-password");
+  const sipCallerIdInput = document.getElementById("sip-caller-id");
+  const sipRememberCheck = document.getElementById("sip-remember");
+  const sipConnectBtn = document.getElementById("sip-connect-btn");
 
   // Account Mode Form
   const authIdInput = document.getElementById("vobiz-auth-id");
@@ -43,18 +54,13 @@ document.addEventListener("DOMContentLoaded", () => {
   const agentSelect = document.getElementById("loginAgentSelect");
   const accountLoginBtn = document.getElementById("vobiz-login-btn");
 
-  // SIP Direct Mode Form
-  const sipUserInput = document.getElementById("sip-username");
-  const sipPassInput = document.getElementById("sip-password");
-  const sipCallerIdInput = document.getElementById("sip-caller-id");
-  const sipRememberCheck = document.getElementById("sip-remember");
-  const sipConnectBtn = document.getElementById("sip-connect-btn");
-
   const loginStatusEl = document.getElementById("vobiz-login-status");
   const logoutBtn = document.getElementById("logoutBtn");
 
   // Step 2 & 3: Caller ID & Dialer
   const numberSelect = document.getElementById("vobiz-number-select");
+  const enableInboundBtn = document.getElementById("enable-inbound-btn");
+  const inboundStatusEl = document.getElementById("inbound-status");
   const dialInput = document.getElementById("dialnumber");
   const dialBtn = document.getElementById("dialbtn");
   const testInboundBtn = document.getElementById("testInboundBtn");
@@ -105,6 +111,10 @@ document.addEventListener("DOMContentLoaded", () => {
   let isOnHold = false;
   let currentCallStartTime = null;
   let sessionToken = "";
+  // From GET /api/numbers: [{ e164, applicationId }] — the application each
+  // number is attached to now, and this integration's own application.
+  let numberDetails = [];
+  let integrationAppId = "";
 
   // Every call-data and call-placing route on the backend sits behind the
   // session now, so requests go through here rather than a bare fetch().
@@ -174,6 +184,9 @@ document.addEventListener("DOMContentLoaded", () => {
     if (testInboundBtn) testInboundBtn.disabled = !canDial;
     if (dialInput) dialInput.disabled = !accountReady;
     if (numberSelect) numberSelect.disabled = !accountReady;
+    if (enableInboundBtn) {
+      enableInboundBtn.disabled = authMode === "sip" || !accountReady || !numberSelect || !numberSelect.value;
+    }
 
     if (!accountReady) {
       if (dialHint) dialHint.textContent = "Sign in to activate the dialer.";
@@ -182,17 +195,29 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }
 
-  // ─── Dual Login Tab Switching ──────────────────────────────────────────────
+  // ─── Sign-in Tab Switching ────────────────────────────────────────────────
+
+  function storageSet(k, v) {
+    try { localStorage.setItem(k, v); } catch (_) {}
+  }
+  function storageGet(k) {
+    try { return localStorage.getItem(k); } catch (_) { return null; }
+  }
+  function storageDel(k) {
+    try { localStorage.removeItem(k); } catch (_) {}
+  }
 
   function setAuthMode(mode) {
     authMode = mode === "sip" ? "sip" : "account";
-    localStorage.setItem(AUTH_MODE_KEY, authMode);
+    storageSet(AUTH_MODE_KEY, authMode);
 
     const isSip = authMode === "sip";
     if (modeAccountPanel) modeAccountPanel.hidden = isSip;
     if (modeSipPanel) modeSipPanel.hidden = !isSip;
-    // Keep Step 2 Caller ID selector ALWAYS visible so user can pick any purchased account number
-    if (stepCallerId) stepCallerId.hidden = false;
+    // The number list comes from the account API: SIP Direct uses the caller ID
+    // typed into its own form instead, and says what needs the account sign-in.
+    if (stepCallerId) stepCallerId.hidden = isSip;
+    if (sipModeNote) sipModeNote.hidden = !isSip;
 
     if (modeAccountTab) {
       modeAccountTab.classList.toggle("is-active", !isSip);
@@ -202,10 +227,11 @@ document.addEventListener("DOMContentLoaded", () => {
       modeSipTab.classList.toggle("is-active", isSip);
       modeSipTab.setAttribute("aria-selected", String(isSip));
     }
+    updateDialButtonState();
   }
 
-  if (modeAccountTab) modeAccountTab.addEventListener("click", () => setAuthMode("account"));
-  if (modeSipTab) modeSipTab.addEventListener("click", () => setAuthMode("sip"));
+  if (modeAccountTab) modeAccountTab.addEventListener("click", () => { if (!accountReady) setAuthMode("account"); });
+  if (modeSipTab) modeSipTab.addEventListener("click", () => { if (!accountReady) setAuthMode("sip"); });
 
   // ─── Ringtone Generator ───────────────────────────────────────────────────
 
@@ -331,8 +357,7 @@ document.addEventListener("DOMContentLoaded", () => {
     try {
       const res = await authFetch(`/api/clickup/search-task?phone=${encodeURIComponent(cleanPhone)}`);
       if (res.status === 403) {
-        // SIP-direct sessions do not read ClickUp; the call is still logged.
-        if (cuTaskName) cuTaskName.textContent = "Task lookup needs the Vobiz account sign-in — the call is still logged";
+        if (cuTaskName) cuTaskName.textContent = "Sign in with your Vobiz account to use task lookup — the call is still logged";
         return;
       }
       const data = await res.json();
@@ -368,7 +393,7 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   }
 
-  // ─── Mode 1: Vobiz Account Login ──────────────────────────────────────────
+  // ─── Vobiz Account Sign-in ──────────────────────────────────────────
 
   async function vobizAccountLogin() {
     const authId = authIdInput.value.trim();
@@ -416,6 +441,8 @@ document.addEventListener("DOMContentLoaded", () => {
       log(`Vobiz account verified (${authId}). Loaded ${(data.numbers || []).length} phone numbers.`, "success");
 
       // Populate caller ID dropdown
+      numberDetails = data.numberDetails || [];
+      integrationAppId = data.appId || "";
       populateNumberSelect(data.numbers || [], data.selected);
 
       // Attempt SIP client connection in background
@@ -430,11 +457,14 @@ document.addEventListener("DOMContentLoaded", () => {
   function populateNumberSelect(numbers, selected) {
     if (!numberSelect) return;
     numberSelect.innerHTML = "";
+    // The caller ID always comes from the signed-in account's own numbers.
+    // With none, there is nothing to call from, and the panel says so.
     if (numbers.length === 0) {
       const opt = document.createElement("option");
-      opt.value = selected || "+15550100000";
-      opt.textContent = selected || "+15550100000 (Default DID)";
+      opt.value = "";
+      opt.textContent = "No numbers on this Vobiz account";
       numberSelect.appendChild(opt);
+      updateDialButtonState();
       return;
     }
 
@@ -445,7 +475,41 @@ document.addEventListener("DOMContentLoaded", () => {
       if (num === selected) opt.selected = true;
       numberSelect.appendChild(opt);
     });
+    updateDialButtonState();
   }
+
+  async function enableInbound() {
+    const number = numberSelect ? numberSelect.value : "";
+    if (!number) return;
+    const detail = numberDetails.find((n) => n.e164 === number) || {};
+    if (detail.applicationId && detail.applicationId === integrationAppId) {
+      if (inboundStatusEl) inboundStatusEl.textContent = `${number} already rings this softphone.`;
+      return;
+    }
+    const current = detail.applicationId
+      ? `It is attached to Vobiz application ${detail.applicationId} now, and will be moved off it.`
+      : "It is not attached to any Vobiz application now.";
+    const ok = window.confirm(`Route inbound calls to ${number} into this softphone?\n\n${current}`);
+    if (!ok) return;
+    if (inboundStatusEl) inboundStatusEl.textContent = `Enabling inbound calls on ${number}…`;
+    try {
+      const res = await authFetch("/api/inbound/enable", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ number }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      if (inboundStatusEl) inboundStatusEl.textContent = `Inbound calls to ${number} now ring this softphone.`;
+      if (detail.e164) detail.applicationId = integrationAppId;
+      log(`Inbound calls enabled on ${number}.`, "success");
+    } catch (e) {
+      if (inboundStatusEl) inboundStatusEl.textContent = `Could not enable inbound calls: ${e.message}`;
+      log(`Enable inbound failed: ${e.message}`, "error");
+    }
+  }
+
+  if (enableInboundBtn) enableInboundBtn.addEventListener("click", enableInbound);
 
   if (numberSelect) {
     numberSelect.addEventListener("change", async () => {
@@ -460,6 +524,7 @@ document.addEventListener("DOMContentLoaded", () => {
           },
           body: JSON.stringify({ number: selected, agentId: agentSelect.value })
         });
+        updateDialButtonState();
       } catch (e) {
         console.warn("[Softphone] select-number failed:", e);
       }
@@ -484,62 +549,59 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }
 
-  // ─── Mode 2: SIP Direct Login ─────────────────────────────────────────────
+  // ─── SIP Direct Sign-in ───────────────────────────────────────────────────
 
   async function vobizSipDirectLogin() {
     const sipUser = sipUserInput.value.trim();
     const sipPassword = sipPassInput.value.trim();
-    const callerId = sipCallerIdInput.value.trim() || "+15550100000";
+    const callerId = sipCallerIdInput.value.trim();
     const remember = sipRememberCheck.checked;
 
-    if (!sipUser || !sipPassword) {
-      setLoginStatus("Enter SIP username and password.");
+    if (!sipUser || !sipPassword || !callerId) {
+      setLoginStatus("Enter the SIP username, password and caller ID.");
       setStatus("SIP credentials required", "error");
       return;
     }
 
-    // Remember who, not the password. localStorage survives the tab, is
-    // readable by any script on this origin, and a SIP password is enough to
-    // place calls billed to the account.
-    if (remember) {
-      localStorage.setItem(SIP_CREDS_KEY, JSON.stringify({ sipUser, callerId }));
-    } else {
-      localStorage.removeItem(SIP_CREDS_KEY);
-    }
+    // Remember who, not the password: a SIP password is enough to place calls
+    // billed to the account.
+    if (remember) storageSet(SIP_CREDS_KEY, JSON.stringify({ sipUser, callerId }));
+    else storageDel(SIP_CREDS_KEY);
 
     setLoginStatus(`Connecting directly as ${sipUser}…`);
     setStatus("Connecting…", "pending");
-    log(`Attempting direct SIP registration for ${sipUser} with Caller ID ${callerId}…`);
+    log(`Attempting direct SIP registration for ${sipUser} with caller ID ${callerId}…`);
 
-    // Register caller ID with backend so /answer can format the right callerId
+    // Tell the backend which caller ID this SIP user dials out with, and which
+    // number's inbound calls ring it. The password is not sent.
     try {
       const sipRes = await fetch(`${backendUrl}/login-sip`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sipUser, callerId })
+        body: JSON.stringify({ sipUser, callerId }),
       });
       const sipJson = await sipRes.json().catch(() => ({}));
-      if (sipJson && sipJson.token) sessionToken = sipJson.token;
-      if (!sipRes.ok) {
-        // Most often: the caller ID is not a number on the account. Calls would
-        // go out under the server default instead, so say so.
-        log(`Caller ID not accepted: ${sipJson.error || `HTTP ${sipRes.status}`}`, "error");
-        setLoginStatus(`Caller ID not accepted: ${sipJson.error || `HTTP ${sipRes.status}`}`);
-      }
+      if (!sipRes.ok || !sipJson.token) throw new Error(sipJson.error || `HTTP ${sipRes.status}`);
+      sessionToken = sipJson.token;
+      storageSet(SESSION_KEY, JSON.stringify({ token: sessionToken, mode: "sip" }));
     } catch (e) {
-      console.warn("[Softphone] /login-sip notice:", e.message);
+      log(`SIP Direct sign-in refused: ${e.message}`, "error");
+      setLoginStatus(`Sign-in failed: ${e.message}`);
+      setStatus("Offline", "error");
+      return;
     }
 
     accountReady = true;
+    if (sipPassInput) sipPassInput.value = "";
     if (logoutBtn) logoutBtn.classList.remove("hidden");
+    updateDialButtonState();
 
     const ok = window.VobizSip.connectDirect({
       sipUser,
       sipPassword,
       displayName: sipUser,
-      audioElement: remoteAudio
+      audioElement: remoteAudio,
     });
-
     if (!ok) {
       setStatus("SIP Error", "error");
       log("SIP direct initialization failed.", "error");
@@ -558,7 +620,6 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     localStorage.removeItem(SESSION_KEY);
-    localStorage.removeItem(SIP_CREDS_KEY);
     sessionToken = "";
     accountReady = false;
     sipRegistered = false;
@@ -566,13 +627,15 @@ document.addEventListener("DOMContentLoaded", () => {
     window.VobizSip.unregister();
     if (authIdInput) authIdInput.value = "";
     if (authTokenInput) authTokenInput.value = "";
-    if (sipUserInput) sipUserInput.value = "";
     if (sipPassInput) sipPassInput.value = "";
+    storageDel(SIP_CREDS_KEY);
     setLoginStatus("Not signed in.");
     if (logoutBtn) logoutBtn.classList.add("hidden");
     setStatus("Offline", "error");
     updateDialButtonState();
     if (clickupTaskBox) clickupTaskBox.classList.add("hidden");
+    populateNumberSelect([], "");
+    if (inboundStatusEl) inboundStatusEl.textContent = "";
   }
 
   if (accountLoginBtn) accountLoginBtn.addEventListener("click", vobizAccountLogin);
@@ -598,16 +661,14 @@ document.addEventListener("DOMContentLoaded", () => {
 
   window.VobizSip.on("registrationFailed", (cause) => {
     sipRegistered = false;
-    if (authMode === "account") {
-      // Not "Ready": without a registration there is nothing to call with.
-      setStatus("Not registered", "error");
-      setLoginStatus(`Signed in, but the softphone could not register: ${cause}. Check VOBIZ_SIP_USER and VOBIZ_SIP_PASSWORD on the server.`);
-      log(`SIP registration failed: ${cause}`, "error");
-    } else {
-      setStatus("Offline", "error");
-      setLoginStatus(`SIP registration failed: ${cause}. Check your SIP username and password.`);
-      log(`SIP registration failed: ${cause}`, "error");
-    }
+    // Not "Ready": without a registration there is nothing to call with.
+    setStatus("Not registered", "error");
+    setLoginStatus(
+      authMode === "sip"
+        ? `SIP registration failed: ${cause}. Check the endpoint's SIP username and password.`
+        : `Signed in, but the softphone could not register: ${cause}. Sign out and sign in again to reset this agent's SIP password.`
+    );
+    log(`SIP registration failed: ${cause}`, "error");
     updateDialButtonState();
   });
 
@@ -738,12 +799,7 @@ document.addEventListener("DOMContentLoaded", () => {
       activeApiCallUuid = null;
       const durationSec = secondsElapsed;
       const callerNumber = currentCallDirection === "Inbound" ? incomingCallerNumber : dialInput.value.trim();
-      let callerId = "";
-      if (authMode === "sip") {
-        callerId = sipCallerIdInput.value.trim() || "+15550100000";
-      } else {
-        callerId = numberSelect.value || "+15550100000";
-      }
+      const callerId = currentCallerId();
 
       log(`Ending call session ${callUuid} (duration: ${formatDuration(durationSec)})…`);
 
@@ -773,6 +829,13 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }
 
+  // The caller ID is the signed-in account's selected number, or in SIP
+  // Direct the one the agent typed. Never a built-in default.
+  function currentCallerId() {
+    if (authMode === "sip") return sipCallerIdInput ? sipCallerIdInput.value.trim() : "";
+    return numberSelect ? numberSelect.value : "";
+  }
+
   function initiateCall() {
     const number = dialInput.value.trim();
     if (!number) {
@@ -781,11 +844,16 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     currentCallDirection = "Outbound";
-    let callerId = "";
-    if (authMode === "sip") {
-      callerId = sipCallerIdInput.value.trim() || "+15550100000";
-    } else {
-      callerId = numberSelect.value || "+15550100000";
+    // The caller ID is one of the signed-in account's numbers, never a default.
+    const callerId = currentCallerId();
+    if (!callerId) {
+      log(
+        authMode === "sip"
+          ? "Enter a caller ID in the SIP Direct form, then connect again."
+          : "This Vobiz account has no number to call from. Add one in the Vobiz console, then sign in again.",
+        "error"
+      );
+      return;
     }
 
     log(`Placing outbound call to ${number} (Caller ID: ${callerId})…`);
@@ -819,7 +887,7 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   // ─── Simulate Inbound Call (For 1-click Auth ID / Token Testing) ───────────
-  function simulateInboundCall(mockCaller = "+14155550199") {
+  function simulateInboundCall(mockCaller = "+15550100199") {
     currentCallDirection = "Inbound";
     incomingPending = true;
     incomingCallerNumber = mockCaller;
@@ -997,6 +1065,8 @@ document.addEventListener("DOMContentLoaded", () => {
       if (res.ok) {
         const data = await res.json();
         if (data.numbers && data.numbers.length > 0) {
+          numberDetails = data.numberDetails || [];
+          integrationAppId = data.appId || "";
           populateNumberSelect(data.numbers, data.selected);
         }
       }
@@ -1006,20 +1076,24 @@ document.addEventListener("DOMContentLoaded", () => {
   async function autoRestore() {
     await loadAvailableNumbers();
 
-    const savedMode = localStorage.getItem(AUTH_MODE_KEY) || "account";
+    const savedMode = storageGet(AUTH_MODE_KEY) || "account";
     setAuthMode(savedMode);
 
     if (savedMode === "sip") {
-      const savedSip = JSON.parse(localStorage.getItem(SIP_CREDS_KEY) || "null");
+      // The username and caller ID come back; the password is never stored,
+      // so the agent types it and connects again.
+      let savedSip = null;
+      try { savedSip = JSON.parse(storageGet(SIP_CREDS_KEY) || "null"); } catch (_) {}
       if (savedSip && savedSip.sipUser) {
-        // The username and caller ID come back; the password does not, because
-        // it is no longer stored. The agent types it, then connects.
         sipUserInput.value = savedSip.sipUser;
         sipCallerIdInput.value = savedSip.callerId || "";
         sipRememberCheck.checked = true;
         sipPassInput.focus();
-        return;
       }
+      setStatus("Offline", "error");
+      setLoginStatus("Not signed in.");
+      updateDialButtonState();
+      return;
     }
 
     // Check account session
@@ -1030,7 +1104,7 @@ document.addEventListener("DOMContentLoaded", () => {
           headers: { Authorization: `Bearer ${savedSession.token}` }
         });
         const data = await res.json();
-        if (data.loggedIn) {
+        if (data.loggedIn && data.mode !== "sip") {
           sessionToken = savedSession.token;
           accountReady = true;
           setStatus("Registering…", "pending");
@@ -1039,9 +1113,8 @@ document.addEventListener("DOMContentLoaded", () => {
           if (authTokenInput) authTokenInput.value = "";
           setLoginStatus(`Signed in as ${data.agentId} (${data.authId}) — registering the softphone…`);
           if (logoutBtn) logoutBtn.classList.remove("hidden");
-          if (data.numbers && data.numbers.length > 0) {
-            populateNumberSelect(data.numbers, data.from);
-          }
+          populateNumberSelect(data.numbers || [], data.from);
+          loadAvailableNumbers();
           connectSipViaAccount(sessionToken);
           loadCallHistory();
           return;

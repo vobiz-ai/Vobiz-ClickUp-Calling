@@ -6,13 +6,7 @@
   "scripts": {
     "start": "node backend/server.js",
     "test": "node scripts/run-verification.js",
-    "provision": "node scripts/create-vobiz-app-and-endpoint.js",
-    "tunnel": "node scripts/tunnel.js",
-    "test:outbound": "node scripts/test-clickup-sync.js --mock-outbound",
-    "test:inbound": "node scripts/test-clickup-sync.js --mock-inbound",
-    "test:sync": "node scripts/test-clickup-sync.js --sync-cdrs",
-    "test:recording": "node scripts/test-clickup-sync.js --test-recording",
-    "fetch-cdr": "node scripts/fetch-cdr.js --sync"
+    "tunnel": "node scripts/tunnel.js"
   },
   "keywords": [
     "vobiz",

@@ -9,9 +9,11 @@ cause entirely, so read the whole entry before acting on the error text.
 
 The tunnel hostname changed. Two things go stale together:
 
-1. `TUNNEL_URL` in `backend/.env` — or delete it and let
+1. `PUBLIC_BASE_URL` / `TUNNEL_URL` in `backend/.env` — or delete them and let
    `backend/tunnel-url.txt` supply the value, which `npm run tunnel` rewrites
-2. the Vobiz application's `answer_url` — re-run `npm run provision`
+2. each account's Vobiz application `answer_url` — sign in again: the backend
+   finds or creates the application for the new URL and rebinds the endpoint.
+   Click **Enable inbound calls** again for inbound numbers.
 
 Confirm the first with `curl -s "$BASE/health"`, the second by watching the log
 while you call the DID. No `/answer` line means Vobiz is still calling the old
@@ -26,10 +28,13 @@ The status badge is the SIP registration, not the backend connection.
 - **Account mode**: `vobiz-sip.js` fetches credentials from `/api/agent-sip`,
   which requires a session. If sign-in failed, registration never starts — look
   for `401` in the browser console.
-- **`VOBIZ_SIP_USER / VOBIZ_SIP_PASSWORD are not configured on this server`** —
-  exactly what it says. The backend will not invent a password, because a
-  default password in a published file is a published password.
-- **SIP-direct mode**: the password is proven by the REGISTER itself, so a wrong
+- **Account mode, "not registered"**: sign out and in again. Each sign-in sets a
+  fresh SIP password on the agent's endpoint; a second tab signed in as the same
+  agent replaces it, and the first tab's registration then fails.
+- **"Signed in to Vobiz, but setting up the softphone failed"** — creating the
+  application or endpoint was refused. The log line `[provision] …` gives the
+  HTTP status.
+- **SIP Direct mode**: the password is proven by the REGISTER itself, so a wrong
   one shows as "not Ready" with no sign-in error.
 - Microphone permission must be granted **before** registration, and the page
   must be HTTPS or `localhost` for `getUserMedia` to exist at all.
@@ -43,12 +48,9 @@ unreachable — a closed egress port, a proxy, or `VOBIZ_API_URL` pointing
 somewhere wrong. The log distinguishes them:
 
 ```
-[backend] Vobiz rejected <id>: HTTP 401          ← credentials are wrong
-[backend] Could not reach Vobiz to validate: …   ← the network is wrong
+[backend] Vobiz refused sign-in for <id>: HTTP 401   ← credentials are wrong
+[backend] Could not reach Vobiz to check <id>: …     ← the network is wrong (the panel gets a 502)
 ```
-
-A server bound to an account through `.env` short-circuits this: matching
-`VOBIZ_AUTH_ID` and `VOBIZ_AUTH_TOKEN` exactly is accepted without a round trip.
 
 ---
 
@@ -83,11 +85,23 @@ what selects that branch.
 
 ---
 
-## Inbound rings the wrong agent
+## Inbound does not ring, or rings the wrong agent
 
-The inbound bridge targets `VOBIZ_SIP_USER`, or else the first live session
-carrying a SIP username. With more than one agent signed in, which one rings is
-arbitrary. There is no routing or presence.
+Inbound is routed by the webhook's `ParentAuthID` to that account's signed-in
+agents, all of whom ring at once; without it, by the dialled number. Check:
+
+- someone from that account is signed in **since the last backend restart** —
+  tokens and routing live in memory, so after a restart inbound calls hang up
+  politely (`matches no signed-in account`) until an agent signs in again;
+- the number was attached with **Enable inbound calls** (account mode), or by
+  hand to the right application (SIP Direct);
+- in SIP Direct, the caller ID typed at sign-in is the number being dialled.
+
+## "Sign in again" when playing a recording
+
+Playback uses the credentials of the account the recording belongs to, and those
+live in memory. After a restart, a link for an account nobody has signed in to
+since answers 409 until someone from that account signs in.
 
 ---
 

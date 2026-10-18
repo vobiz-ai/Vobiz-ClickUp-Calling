@@ -3,13 +3,23 @@
  * THE BROWSER IS THE A LEG.
  * The softphone sends the SIP INVITE itself via WebRTC (JsSIP),
  * and this backend answers with <Dial><Number> to bridge to the customer.
- * Inbound calls to account DIDs are bridged via <Dial><User> to the registered agent softphone.
+ * Inbound calls to a signed-in account's DIDs are bridged via <Dial><User> to
+ * that account's registered agent softphones.
+ *
+ * ANY VOBIZ ACCOUNT CAN SIGN IN.
+ * Nothing account-specific lives in the environment. An agent types their own
+ * Auth ID and Auth Token into the panel; this backend checks the pair against
+ * Vobiz, then, in that account:
+ *   - finds or creates this integration's Application (matched on answer_url);
+ *   - finds or creates one SIP endpoint per (account, agent), sets a fresh SIP
+ *     password for this sign-in, and binds the endpoint to the application.
+ * The Auth Token is held in memory only, keyed by Auth ID. It is never written
+ * to disk, never logged and never returned to the browser.
  *
  * All completed calls, durations, and call recordings are synced to ClickUp tasks.
  */
 
 const http = require("http");
-const https = require("https");
 const fs = require("fs");
 const path = require("path");
 const url = require("url");
@@ -35,14 +45,13 @@ if (fs.existsSync(envPath)) {
 
 const cleanEnvVar = (val) => val?.trim().replace(/^["']|["']$/g, "") || "";
 
+// Deployment configuration only. No Vobiz account, number or endpoint is
+// configured here: those come from whoever signs in.
 const PORT = Number(cleanEnvVar(process.env.PORT) || 8092);
-const VOBIZ_AUTH_ID = cleanEnvVar(process.env.VOBIZ_AUTH_ID);
-const VOBIZ_AUTH_TOKEN = cleanEnvVar(process.env.VOBIZ_AUTH_TOKEN);
-const VOBIZ_FROM_NUMBER = cleanEnvVar(process.env.VOBIZ_FROM_NUMBER) || "+15550100000";
-const VOBIZ_API_URL = cleanEnvVar(process.env.VOBIZ_API_URL) || "https://api.vobiz.ai";
-const VOBIZ_SIP_USER = cleanEnvVar(process.env.VOBIZ_SIP_USER) || "admin";
-const VOBIZ_SIP_PASSWORD = cleanEnvVar(process.env.VOBIZ_SIP_PASSWORD) || "";
+const VOBIZ_API_URL = (cleanEnvVar(process.env.VOBIZ_API_URL) || "https://api.vobiz.ai").replace(/\/+$/, "");
 const VOBIZ_REGISTRAR = cleanEnvVar(process.env.VOBIZ_REGISTRAR) || "registrar.vobiz.ai";
+const DATA_DIR = path.resolve(cleanEnvVar(process.env.DATA_DIR) || path.join(__dirname, "data"));
+const APP_NAME = "Vobiz ClickUp Calling";
 
 const CLICKUP_API_TOKEN = cleanEnvVar(process.env.CLICKUP_API_TOKEN);
 const CLICKUP_LIST_ID = cleanEnvVar(process.env.CLICKUP_LIST_ID);
@@ -55,7 +64,8 @@ const RECORDING_URL_TTL_SECONDS = Number(cleanEnvVar(process.env.RECORDING_URL_T
 const TUNNEL_URL_FILE = path.join(__dirname, "tunnel-url.txt");
 
 function getPublicBaseUrl(req) {
-  if (process.env.TUNNEL_URL) return process.env.TUNNEL_URL.trim().replace(/\/+$/, "");
+  const configured = cleanEnvVar(process.env.PUBLIC_BASE_URL) || cleanEnvVar(process.env.TUNNEL_URL);
+  if (configured) return configured.replace(/\/+$/, "");
   try {
     if (fs.existsSync(TUNNEL_URL_FILE)) {
       const urlStr = fs.readFileSync(TUNNEL_URL_FILE, "utf8").trim();
@@ -80,92 +90,39 @@ function getAllAgents() {
     console.error("[backend] Error reading agents.json:", err.message);
   }
   return {
-    admin: {
-      name: "System Administrator",
-      sipUser: `${VOBIZ_SIP_USER || "admin"}@${VOBIZ_REGISTRAR}`,
-      clickUpUserId: "12345678",
-      clickUpEmail: "admin@vobiz.ai",
-    },
-    agent1: {
-      name: "John Doe",
-      sipUser: `agent1@${VOBIZ_REGISTRAR}`,
-      clickUpUserId: "87654321",
-      clickUpEmail: "john.doe@vobiz.ai",
-    }
+    admin: { name: "System Administrator", clickUpUserId: "", clickUpEmail: "" },
   };
 }
 
 /**
- * Agent display metadata. Deliberately carries no SIP password: agents.json is
- * committed, so a password written into it is a published password. The SIP
- * password comes from the environment and is served only to a signed-in caller.
+ * Agent display metadata (name, ClickUp user). agents.json carries no SIP
+ * identity at all: each agent's endpoint is provisioned in the signed-in
+ * account when they sign in.
  */
 function getAgent(agentId) {
   const agents = getAllAgents();
-  const found = agents[agentId] || agents["admin"];
+  const found = agents[agentId];
   if (found) {
-    const { name, sipUser, clickUpUserId, clickUpEmail } = found;
-    return { name, sipUser, clickUpUserId, clickUpEmail };
+    const { name, clickUpUserId, clickUpEmail } = found;
+    return { name, clickUpUserId, clickUpEmail };
   }
-  return {
-    name: agentId ? `Agent (${agentId})` : "ClickUp Agent",
-    sipUser: `${agentId || "agent"}@${VOBIZ_REGISTRAR}`,
-    clickUpUserId: "",
-    clickUpEmail: "",
-  };
+  return { name: agentId ? `Agent (${agentId})` : "ClickUp Agent", clickUpUserId: "", clickUpEmail: "" };
 }
 
 // ─── State Maps ─────────────────────────────────────────────────────────────
-// sessionToken -> { agentId, authId, authToken, numbers, from, createdAt }
+// authId -> { authToken, numbers, appId }. Memory only: the token never touches disk.
+const accounts = new Map();
+// sessionToken -> { agentId, authId, numbers, from, sipUser, sipPassword, createdAt }
 const sessions = new Map();
-// sipUser -> callerId
-const fromBySipUser = new Map();
+// SIP username -> { authId, agentId, callerId }. How a webhook finds its account.
+const sipUsers = new Map();
 // callUuid -> callRecord
 const callsByUuid = new Map();
 // Completed call recordings
 const callRecordings = new Map();
 const recentCalls = [];
-let cachedAccountNumbers = [];
-
-async function refreshAccountNumbers() {
-  if (!VOBIZ_AUTH_ID || !VOBIZ_AUTH_TOKEN || VOBIZ_AUTH_ID.includes("YOUR_")) return;
-  try {
-    const res = await fetch(`${VOBIZ_API_URL}/api/v1/Account/${encodeURIComponent(VOBIZ_AUTH_ID)}/numbers?per_page=50`, {
-      headers: {
-        "X-Auth-ID": VOBIZ_AUTH_ID,
-        "X-Auth-Token": VOBIZ_AUTH_TOKEN,
-        Accept: "application/json",
-      },
-    });
-    if (res.ok) {
-      const json = await res.json();
-      const items = json.objects || json.items || [];
-      const nums = items.map((n) => n.e164 || n.number || n.phone_number).filter(Boolean);
-      if (nums.length > 0) {
-        cachedAccountNumbers = nums;
-        console.log(`[backend] Loaded ${nums.length} account phone numbers from Vobiz API:`, nums);
-      }
-    }
-  } catch (err) {
-    console.warn("[backend] Notice fetching account numbers:", err.message);
-  }
-}
-refreshAccountNumbers();
 
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
-
-function newSession(agentId, authId, authToken, numbers, from) {
-  const token = crypto.randomBytes(32).toString("hex");
-  sessions.set(token, {
-    agentId,
-    authId,
-    authToken,
-    numbers,
-    from: from || (numbers && numbers[0]) || VOBIZ_FROM_NUMBER,
-    createdAt: Date.now(),
-  });
-  return token;
-}
 
 function getSession(req) {
   const header = (req.headers && req.headers.authorization) || "";
@@ -205,11 +162,294 @@ function formatDuration(seconds) {
   return `${mins}:${secs}`;
 }
 
+function xmlEscape(v) {
+  return String(v == null ? "" : v)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+// ─── Vobiz REST helpers ──────────────────────────────────────────────────────
+//
+// Vobiz ids (app_id in particular) are 17 digits, above
+// Number.MAX_SAFE_INTEGER. JSON.parse would round an unquoted one, so long
+// integer literals are quoted before parsing and every id stays a string end to
+// end. Request bodies that must carry an id as an integer have it spliced into
+// the JSON text after a /^\d+$/ check, never passed through Number().
+
+function parseJsonKeepingBigInts(text) {
+  const quoted = String(text || "").replace(/([:\[,]\s*)(-?\d{16,})(?=\s*[,\]}])/g, '$1"$2"');
+  return JSON.parse(quoted);
+}
+
+function idString(v) {
+  if (v == null) return "";
+  if (typeof v === "object") return idString(v.app_id || v.id || "");
+  return String(v);
+}
+
+function vobizHeaders(authId, authToken) {
+  return {
+    "X-Auth-ID": authId,
+    "X-Auth-Token": authToken,
+    "Content-Type": "application/json",
+    Accept: "application/json",
+  };
+}
+
+/** Call the Vobiz API for one account. Resolves { status, ok, text, json }. */
+async function vobiz(authId, authToken, method, apiPath, rawBody) {
+  const res = await fetch(`${VOBIZ_API_URL}/api/v1/Account/${encodeURIComponent(authId)}${apiPath}`, {
+    method,
+    headers: vobizHeaders(authId, authToken),
+    ...(rawBody != null ? { body: rawBody } : {}),
+  });
+  const text = await res.text();
+  let json = null;
+  try {
+    json = text ? parseJsonKeepingBigInts(text) : null;
+  } catch (_) {}
+  return { status: res.status, ok: res.ok, text, json };
+}
+
+/**
+ * Caller IDs an agent may pick: the account's numbers that are active and
+ * voice-enabled, as { e164, applicationId }. applicationId is the app the
+ * number is attached to now, so "Enable inbound calls" can say what it moves
+ * the number away from.
+ */
+function parseNumberItems(json) {
+  const items = (json && (json.items || json.objects)) || [];
+  return items
+    .filter((n) => n && n.status === "active" && n.voice_enabled !== false)
+    .map((n) => ({ e164: toE164(n.e164), applicationId: idString(n.application_id) }))
+    .filter((n) => n.e164);
+}
+
+/**
+ * Verify the pair and load the account's numbers, every page of them.
+ * Throws { status } when Vobiz refuses the credentials.
+ */
+async function loadAccountNumbers(authId, authToken) {
+  const all = [];
+  for (let page = 1; page <= 50; page++) {
+    const r = await vobiz(authId, authToken, "GET", `/numbers?page=${page}&per_page=100`);
+    if (!r.ok) {
+      if (page === 1) {
+        const err = new Error(`Vobiz refused these credentials (HTTP ${r.status})`);
+        err.status = r.status;
+        throw err;
+      }
+      console.warn(`[backend] ${authId}: numbers page ${page} failed (HTTP ${r.status}); using the first ${page - 1} page(s)`);
+      break;
+    }
+    const raw = (r.json && (r.json.items || r.json.objects)) || [];
+    all.push(...parseNumberItems(r.json));
+    const total = Number(r.json && r.json.total);
+    const seen = (page - 1) * 100 + raw.length;
+    if (raw.length === 0 || raw.length < 100 || (Number.isFinite(total) && seen >= total)) break;
+  }
+  const seenE164 = new Set();
+  return all.filter((n) => (seenE164.has(n.e164) ? false : seenE164.add(n.e164)));
+}
+
+// ─── Endpoint store ─────────────────────────────────────────────────────────
+// `${authId}:${agentId}` -> { endpointId, username }. No passwords, no tokens.
+const ENDPOINTS_FILE = path.join(DATA_DIR, "endpoints.json");
+
+function readEndpointStore() {
+  try {
+    if (fs.existsSync(ENDPOINTS_FILE)) return JSON.parse(fs.readFileSync(ENDPOINTS_FILE, "utf8")) || {};
+  } catch (err) {
+    console.error("[backend] endpoints.json unreadable, starting empty:", err.message);
+  }
+  return {};
+}
+
+function writeEndpointStore(store) {
+  fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(ENDPOINTS_FILE, JSON.stringify(store, null, 2), { mode: 0o600 });
+  try {
+    fs.chmodSync(ENDPOINTS_FILE, 0o600);
+  } catch (_) {}
+}
+
+// ─── Per-sign-in provisioning ───────────────────────────────────────────────
+
+/**
+ * Find this integration's application in the account, or create it. Only an
+ * application whose answer_url is exactly ours counts: an application this
+ * integration did not create is never repointed.
+ */
+async function ensureApplication(authId, authToken, answerUrl, hangupUrl) {
+  const acct = accounts.get(authId);
+  if (acct && acct.appId && acct.answerUrl === answerUrl) return acct.appId;
+
+  for (let offset = 0, page = 0; page < 20; page++, offset += 100) {
+    const r = await vobiz(authId, authToken, "GET", `/Application/?limit=100&offset=${offset}`);
+    if (!r.ok) throw new Error(`listing applications failed (HTTP ${r.status})`);
+    const objects = (r.json && r.json.objects) || [];
+    const mine = objects.find((a) => a && a.answer_url === answerUrl);
+    if (mine && /^\d+$/.test(idString(mine.app_id))) {
+      const appId = idString(mine.app_id);
+      console.log(`[provision] ${authId}: using existing application ${appId}`);
+      return appId;
+    }
+    if (objects.length < 100 || !(r.json.meta && r.json.meta.next)) break;
+  }
+
+  const body = JSON.stringify({
+    app_name: APP_NAME,
+    answer_url: answerUrl,
+    answer_method: "POST",
+    hangup_url: hangupUrl,
+    hangup_method: "POST",
+  });
+  const r = await vobiz(authId, authToken, "POST", "/Application/", body);
+  const appId = idString(r.json && r.json.app_id);
+  if (!r.ok || !/^\d+$/.test(appId)) throw new Error(`creating the application failed (HTTP ${r.status})`);
+  console.log(`[provision] ${authId}: created application ${appId} -> ${answerUrl}`);
+  return appId;
+}
+
+function newSipPassword() {
+  // Hex: alphanumeric, 24 characters, comfortably above the 8-character minimum.
+  return crypto.randomBytes(12).toString("hex");
+}
+
+function endpointBoundApp(json) {
+  if (!json) return "";
+  return idString(json.application) || idString(json.app_id);
+}
+
+/**
+ * Bind the endpoint to the application. First the form the reference
+ * playground uses in production, {"app_id":"<id>"} with the id as a string;
+ * verify by reading the endpoint back; if it did not take, retry once with the
+ * documented {"application": <integer>}, spliced as text so the 17-digit id is
+ * sent exactly. The outcome is logged either way.
+ */
+async function bindEndpoint(authId, authToken, endpointId, appId) {
+  if (!/^\d+$/.test(appId)) throw new Error("refusing to bind a non-numeric app id");
+  const ep = encodeURIComponent(endpointId);
+  await vobiz(authId, authToken, "POST", `/Endpoint/${ep}/`, JSON.stringify({ app_id: appId }));
+  let check = await vobiz(authId, authToken, "GET", `/Endpoint/${ep}/`);
+  if (endpointBoundApp(check.json) === appId) {
+    console.log(`[provision] ${authId}: endpoint ${endpointId} bound to application ${appId}`);
+    return true;
+  }
+  await vobiz(authId, authToken, "POST", `/Endpoint/${ep}/`, '{"application":' + appId + "}");
+  check = await vobiz(authId, authToken, "GET", `/Endpoint/${ep}/`);
+  const bound = endpointBoundApp(check.json) === appId;
+  console.log(
+    `[provision] ${authId}: endpoint ${endpointId} ${bound ? "bound" : "NOT bound"} to application ${appId} after retrying with "application"` +
+      (bound ? "" : `; it reports '${endpointBoundApp(check.json) || "none"}'`)
+  );
+  return bound;
+}
+
+function endpointAlias(agentId) {
+  return `ClickUp-${String(agentId).replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 30) || "agent"}`;
+}
+
+/** An endpoint in the account whose alias is exactly ours, or null. */
+async function findEndpointByAlias(authId, authToken, alias) {
+  for (let offset = 0, page = 0; page < 20; page++, offset += 100) {
+    const r = await vobiz(authId, authToken, "GET", `/Endpoint/?limit=100&offset=${offset}`);
+    if (!r.ok) return null;
+    const objects = (r.json && r.json.objects) || [];
+    const hit = objects.find((e) => e && e.alias === alias && e.endpoint_id && e.username);
+    if (hit) return { endpointId: idString(hit.endpoint_id), username: hit.username };
+    if (objects.length < 100 || !(r.json.meta && r.json.meta.next)) break;
+  }
+  return null;
+}
+
+/**
+ * One endpoint per (account, agent). Reused across sign-ins; every sign-in
+ * gets a fresh SIP password, handed only to that browser session.
+ */
+async function ensureEndpoint(authId, authToken, agentId, appId) {
+  const key = `${authId}:${agentId}`;
+  const store = readEndpointStore();
+  const password = newSipPassword();
+  let entry = store[key];
+
+  if (entry && entry.endpointId) {
+    const ep = encodeURIComponent(entry.endpointId);
+    const existing = await vobiz(authId, authToken, "GET", `/Endpoint/${ep}/`);
+    if (existing.ok) {
+      const upd = await vobiz(authId, authToken, "POST", `/Endpoint/${ep}/`, JSON.stringify({ password }));
+      if (!upd.ok) throw new Error(`setting the SIP password failed (HTTP ${upd.status})`);
+      const storedName = existing.json && existing.json.username;
+      if (storedName && storedName !== entry.username) {
+        entry = { ...entry, username: storedName };
+        store[key] = entry;
+        writeEndpointStore(store);
+      }
+    } else if (existing.status === 404) {
+      entry = null; // deleted in the console; make a new one
+    } else {
+      throw new Error(`reading endpoint ${entry.endpointId} failed (HTTP ${existing.status})`);
+    }
+  }
+
+  if (!entry || !entry.endpointId) {
+    // Not in the local map (first sign-in, or the data dir was lost): reuse
+    // the endpoint with this agent's exact alias if the account has one.
+    const found = await findEndpointByAlias(authId, authToken, endpointAlias(agentId));
+    if (found) {
+      const upd = await vobiz(authId, authToken, "POST", `/Endpoint/${encodeURIComponent(found.endpointId)}/`, JSON.stringify({ password }));
+      if (!upd.ok) throw new Error(`setting the SIP password failed (HTTP ${upd.status})`);
+      entry = found;
+      store[key] = entry;
+      writeEndpointStore(store);
+      console.log(`[provision] ${authId}: reusing endpoint ${found.endpointId} (${found.username}) for agent '${agentId}'`);
+    }
+  }
+
+  if (!entry || !entry.endpointId) {
+    const submitted = `cu${String(agentId).replace(/[^a-zA-Z0-9]/g, "").slice(0, 12)}${crypto.randomBytes(3).toString("hex")}`;
+    const alias = endpointAlias(agentId);
+    const body = JSON.stringify({ username: submitted, password, alias, app_id: appId });
+    const created = await vobiz(authId, authToken, "POST", "/Endpoint/", body);
+    const endpointId = idString(created.json && created.json.endpoint_id);
+    if (!created.ok || !endpointId) throw new Error(`creating the SIP endpoint failed (HTTP ${created.status})`);
+    // Vobiz rewrites the submitted username. Only the stored one registers.
+    const readBack = await vobiz(authId, authToken, "GET", `/Endpoint/${encodeURIComponent(endpointId)}/`);
+    const username = (readBack.json && readBack.json.username) || "";
+    if (!readBack.ok || !username) throw new Error(`reading back endpoint ${endpointId} failed (HTTP ${readBack.status})`);
+    entry = { endpointId, username };
+    store[key] = entry;
+    writeEndpointStore(store);
+    console.log(`[provision] ${authId}: created endpoint ${endpointId} (${username}) for agent '${agentId}'`);
+  }
+
+  await bindEndpoint(authId, authToken, entry.endpointId, appId);
+  return { endpointId: entry.endpointId, username: entry.username, password };
+}
+
 // ─── Recording HMAC Signing ──────────────────────────────────────────────────
-function signRecordingUrl(recordingId, publicBaseUrl) {
+// The account is part of the signed payload and of the link, so a link minted
+// for one account can never be replayed against another account's audio.
+function recordingSig(authId, recordingId, exp) {
+  return crypto.createHmac("sha256", SIGNING_SECRET).update(`${authId}|${recordingId}|${exp}`).digest("hex");
+}
+
+function signRecordingUrl(authId, recordingId, publicBaseUrl) {
   const exp = Math.floor(Date.now() / 1000) + RECORDING_URL_TTL_SECONDS;
-  const sig = crypto.createHmac("sha256", SIGNING_SECRET).update(`${recordingId}|${exp}`).digest("hex");
-  return `${publicBaseUrl}/recording-audio/${encodeURIComponent(recordingId)}?exp=${exp}&sig=${sig}`;
+  const sig = recordingSig(authId, recordingId, exp);
+  return `${publicBaseUrl}/recording-audio/${encodeURIComponent(recordingId)}?a=${encodeURIComponent(authId)}&exp=${exp}&sig=${sig}`;
+}
+
+function verifyRecordingSignature(authId, recordingId, exp, sig) {
+  if (!authId || !exp || !sig) return false;
+  if (Number(exp) < Math.floor(Date.now() / 1000)) return false;
+  const expected = recordingSig(authId, recordingId, exp);
+  const a = Buffer.from(String(sig));
+  const b = Buffer.from(expected);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
 // Hosts this server is willing to fetch call media from. Anything else is
@@ -229,15 +469,6 @@ function isAllowedMediaHost(rawUrl) {
   }
   if (u.protocol !== "https:") return false;
   return MEDIA_HOST_ALLOWLIST.some((re) => re.test(u.hostname));
-}
-
-function verifyRecordingSignature(recordingId, exp, sig) {
-  if (!exp || !sig) return false;
-  if (Number(exp) < Math.floor(Date.now() / 1000)) return false;
-  const expected = crypto.createHmac("sha256", SIGNING_SECRET).update(`${recordingId}|${exp}`).digest("hex");
-  const a = Buffer.from(String(sig));
-  const b = Buffer.from(expected);
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
 // ─── CORS and Helpers ───────────────────────────────────────────────────────
@@ -277,55 +508,41 @@ function requireSession(req, res) {
 }
 
 /**
- * Guard for routes that read account data (recordings, CDRs, ClickUp tasks) or
- * spend money. A SIP-direct session is not enough: /login-sip proves only that
- * the caller knows one of the account's numbers, which is public — it is the
- * number customers dial. Those sessions register their own endpoint and make
- * calls over SIP; they get nothing that belongs to the account.
+ * Guard for routes that need the Vobiz account API (recordings, numbers, CDRs,
+ * inbound attach) or read account/CRM data. A SIP-direct session has no account
+ * credentials, so it is told to sign in with the account instead.
  */
 function requireAccountSession(req, res) {
   const s = getSession(req);
   if (!s) {
-    res.writeHead(401, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Sign in first" }));
+    sendJson(res, 401, { error: "Sign in first" });
     return false;
   }
   if (s.mode === "sip") {
-    res.writeHead(403, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Sign in with the Vobiz account to use this. SIP-direct sessions can only place and take calls." }));
+    sendJson(res, 403, { error: "Sign in with your Vobiz account to use this. SIP-direct sessions can only place and take calls." });
     return false;
   }
   return true;
 }
 
-function serverAccountConfigured() {
-  return !!(VOBIZ_AUTH_ID && VOBIZ_AUTH_TOKEN && !VOBIZ_AUTH_ID.includes("YOUR_"));
+const STRICT_E164 = /^\+\d{10,15}$/;
+
+/** A typed phone number as E.164 (+ and 8-15 digits), or "" if it is not one. */
+function cleanPhone(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return "";
+  const digits = s.replace(/[^\d]/g, "");
+  if (digits.length < 8 || digits.length > 15) return "";
+  if (/[^\d+\s().-]/.test(s)) return "";
+  return `+${digits}`;
 }
 
-function safeEqual(a, b) {
-  const x = Buffer.from(String(a || ""));
-  const y = Buffer.from(String(b || ""));
-  return x.length === y.length && crypto.timingSafeEqual(x, y);
-}
-
-/** Numbers this account owns, as E.164. Empty when they could not be loaded. */
-function ownedNumbers() {
-  const list = [...cachedAccountNumbers];
-  if (process.env.VOBIZ_FROM_NUMBER) list.push(VOBIZ_FROM_NUMBER);
-  return list.map(toE164).filter(Boolean);
-}
-
-/**
- * A caller ID is acceptable only if the account owns it. When the number list
- * could not be loaded, fall back to VOBIZ_FROM_NUMBER rather than trusting the
- * caller.
- */
-function ownedCallerId(candidate) {
-  const owned = ownedNumbers();
+/** A caller ID is acceptable only if this account owns it. */
+function ownedCallerId(authId, candidate) {
+  const acct = accounts.get(authId);
   const wanted = toE164(candidate);
-  if (!wanted) return "";
-  if (owned.length === 0) return "";
-  return owned.includes(wanted) ? wanted : "";
+  if (!acct || !wanted) return "";
+  return acct.numbers.includes(wanted) ? wanted : "";
 }
 
 function readJsonBody(req) {
@@ -345,6 +562,24 @@ function readJsonBody(req) {
     });
     req.on("error", reject);
   });
+}
+
+function sendJson(res, status, obj) {
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(obj));
+}
+
+function sendXml(res, xml) {
+  res.writeHead(200, { "Content-Type": "application/xml" });
+  res.end(xml);
+}
+
+function politeHangup(message) {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Speak>${xmlEscape(message)}</Speak>
+  <Hangup/>
+</Response>`;
 }
 
 // ─── ClickUp REST API Integration ───────────────────────────────────────────
@@ -381,7 +616,8 @@ async function createClickUpCallTask(callData, publicBaseUrl) {
   let {
     callUuid,
     direction = "Outbound",
-    from = VOBIZ_FROM_NUMBER,
+    authId = "",
+    from = "",
     to = "",
     agentId = "admin",
     durationSeconds = 0,
@@ -401,8 +637,10 @@ async function createClickUpCallTask(callData, publicBaseUrl) {
 
   const base = publicBaseUrl || `http://localhost:${PORT}`;
   let proxiedRecordingUrl = "";
-  if (recordingId) {
-    proxiedRecordingUrl = signRecordingUrl(recordingId, base);
+  // The link names the account the recording belongs to, and the signature
+  // covers it, so a link for one account can never fetch another's audio.
+  if (recordingId && authId) {
+    proxiedRecordingUrl = signRecordingUrl(authId, recordingId, base);
   }
   // A raw media URL without a recording ID is not linkable: the old code built
   // a /recording-file?url=… link, which is exactly the hole that route was.
@@ -520,7 +758,8 @@ function syncCallTask(rec, callData, publicBaseUrl) {
 }
 
 /**
- * Resolve a recording ID to its media URL through the Vobiz API and stream it.
+ * Resolve a recording ID to its media URL through the Vobiz API and stream it,
+ * using the credentials of the account the recording belongs to.
  *
  * The account credentials go out on these requests, so the destination is never
  * allowed to come from a caller: it is resolved server-side and checked against
@@ -528,39 +767,38 @@ function syncCallTask(rec, callData, publicBaseUrl) {
  * A presigned object-storage URL carries its own authorisation, so ours is
  * dropped on the way.
  */
-async function streamRecordingById(recordingId, res) {
-  if (!VOBIZ_AUTH_ID || !VOBIZ_AUTH_TOKEN || VOBIZ_AUTH_ID.includes("YOUR_")) {
-    res.writeHead(500, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Vobiz credentials are not configured on this server" }));
+async function streamRecordingById(authId, recordingId, res) {
+  const acct = accounts.get(authId);
+  if (!acct) {
+    // Tokens live in memory only. After a restart, nobody from this account
+    // has signed in again yet, so there is nothing to fetch the audio with.
+    sendJson(res, 409, { error: "This recording's Vobiz account is not signed in on this server. Sign in again, then retry." });
     return;
   }
   const authHeaders = {
-    "X-Auth-ID": VOBIZ_AUTH_ID,
-    "X-Auth-Token": VOBIZ_AUTH_TOKEN,
+    "X-Auth-ID": authId,
+    "X-Auth-Token": acct.authToken,
     Accept: "application/json",
   };
 
   try {
     const metaRes = await fetch(
-      `${VOBIZ_API_URL}/api/v1/Account/${VOBIZ_AUTH_ID}/Recording/${encodeURIComponent(recordingId)}/`,
+      `${VOBIZ_API_URL}/api/v1/Account/${encodeURIComponent(authId)}/Recording/${encodeURIComponent(recordingId)}/`,
       { headers: authHeaders }
     );
     if (!metaRes.ok) {
-      res.writeHead(metaRes.status, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: `Vobiz returned ${metaRes.status} for that recording` }));
+      sendJson(res, metaRes.status, { error: `Vobiz returned ${metaRes.status} for that recording` });
       return;
     }
     const meta = await metaRes.json().catch(() => ({}));
     const mediaUrl = meta.recording_url || meta.url || meta.file;
     if (!mediaUrl) {
-      res.writeHead(404, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "No audio is available for that recording yet" }));
+      sendJson(res, 404, { error: "No audio is available for that recording yet" });
       return;
     }
     if (!isAllowedMediaHost(mediaUrl)) {
       console.error(`[/recording-audio] refusing off-allowlist media host: ${mediaUrl}`);
-      res.writeHead(502, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Recording is hosted somewhere this server will not fetch from" }));
+      sendJson(res, 502, { error: "Recording is hosted somewhere this server will not fetch from" });
       return;
     }
 
@@ -572,8 +810,7 @@ async function streamRecordingById(recordingId, res) {
       const next = new URL(location, mediaUrl).toString();
       if (!isAllowedMediaHost(next)) {
         console.error(`[/recording-audio] refusing redirect to ${next}`);
-        res.writeHead(502, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Recording redirected somewhere this server will not follow" }));
+        sendJson(res, 502, { error: "Recording redirected somewhere this server will not follow" });
         return;
       }
       mediaRes = await fetch(next, { redirect: "manual" });
@@ -581,8 +818,7 @@ async function streamRecordingById(recordingId, res) {
     }
 
     if (!mediaRes.ok) {
-      res.writeHead(mediaRes.status, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: `Media server returned ${mediaRes.status}` }));
+      sendJson(res, mediaRes.status, { error: `Media server returned ${mediaRes.status}` });
       return;
     }
 
@@ -596,8 +832,7 @@ async function streamRecordingById(recordingId, res) {
     res.end(Buffer.from(await mediaRes.arrayBuffer()));
   } catch (err) {
     console.error("[/recording-audio] error:", err.message);
-    res.writeHead(500, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Could not stream that recording" }));
+    sendJson(res, 500, { error: "Could not stream that recording" });
   }
 }
 
@@ -618,247 +853,210 @@ const server = http.createServer(async (req, res) => {
 
   // 1. Health & Status
   if (pathname === "/health" || pathname === "/status") {
-    const publicBaseUrl = getPublicBaseUrl(req);
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        // Health is unauthenticated, so it reports whether things are
-        // configured, never what they are — publishing the account Auth ID or
-        // the SIP username here would hand them to anyone who asks.
-        status: "ok",
-        service: "vobiz-clickup-calling",
-        publicBaseUrl,
-        vobizConfigured: !!(VOBIZ_AUTH_ID && VOBIZ_AUTH_TOKEN && !VOBIZ_AUTH_ID.includes("YOUR_")),
-        sipConfigured: !!(VOBIZ_SIP_USER && VOBIZ_SIP_PASSWORD),
-        vobizRegistrar: VOBIZ_REGISTRAR,
-        clickUpConfigured: !!(CLICKUP_API_TOKEN && !CLICKUP_API_TOKEN.includes("YOUR_CLICKUP")),
-        activeCallsCount: callsByUuid.size,
-        timestamp: new Date().toISOString(),
-      })
-    );
+    // Unauthenticated, so it reports whether things are configured, never
+    // which accounts are signed in or what their numbers are.
+    sendJson(res, 200, {
+      status: "ok",
+      service: "vobiz-clickup-calling",
+      publicBaseUrl: getPublicBaseUrl(req),
+      vobizRegistrar: VOBIZ_REGISTRAR,
+      clickUpConfigured: !!(CLICKUP_API_TOKEN && !CLICKUP_API_TOKEN.includes("YOUR_CLICKUP")),
+      activeCallsCount: callsByUuid.size,
+      timestamp: new Date().toISOString(),
+    });
     return;
   }
 
-  // 1b. List Account Phone Numbers (All purchased account DIDs)
+  // 1b. Numbers on the signed-in account
   if (pathname === "/api/numbers" && method === "GET") {
-    if (!requireSession(req, res)) return;
-    if (cachedAccountNumbers.length === 0) {
-      await refreshAccountNumbers();
+    if (!requireAccountSession(req, res)) return;
+    const s = getSession(req);
+    const acct = accounts.get(s.authId);
+    if (acct) {
+      try {
+        acct.numberDetails = await loadAccountNumbers(s.authId, acct.authToken);
+        acct.numbers = acct.numberDetails.map((n) => n.e164);
+        s.numbers = acct.numbers;
+        if (!acct.numbers.includes(s.from)) s.from = acct.numbers[0] || "";
+      } catch (e) {
+        console.warn(`[backend] numbers refresh for ${s.authId}: ${e.message}`);
+      }
     }
-    const nums = cachedAccountNumbers.length > 0 ? cachedAccountNumbers : (VOBIZ_FROM_NUMBER ? [VOBIZ_FROM_NUMBER] : []);
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ok: true, numbers: nums, selected: VOBIZ_FROM_NUMBER || nums[0] }));
+    sendJson(res, 200, {
+      ok: true,
+      numbers: s.numbers || [],
+      numberDetails: (acct && acct.numberDetails) || [],
+      appId: (acct && acct.appId) || "",
+      selected: s.from || "",
+    });
     return;
   }
 
-  // 2. Dual Login: Mode 1 - Vobiz Account Login (Auth ID & Auth Token)
+  // 2. Sign in with any Vobiz account (Auth ID & Auth Token)
   if (pathname === "/login" && method === "POST") {
     try {
       const body = await readJsonBody(req);
-      const { agentId = "admin", authId, authToken } = body;
+      const agentId = String(body.agentId || "admin").trim() || "admin";
+      const authId = String(body.authId || "").trim();
+      const authToken = String(body.authToken || "").trim();
       if (!authId || !authToken) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "authId and authToken are required" }));
+        sendJson(res, 400, { error: "authId and authToken are required" });
+        return;
+      }
+      if (!/^[A-Za-z0-9_-]{2,64}$/.test(authId)) {
+        sendJson(res, 401, { ok: false, error: "Invalid Vobiz Auth ID or Auth Token." });
         return;
       }
 
-      let numbers = [];
-      const authHeaders = {
-        "X-Auth-ID": authId,
-        "X-Auth-Token": authToken,
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      };
-
-      // Credentials are proven, not assumed.
-      //
-      // The numbers lookup below is not proof: it is allowed to fail, and a
-      // sign-in that treated it as validation would admit anyone who typed
-      // anything.
-      //
-      // This backend is bound to one account. When that account is configured,
-      // only its own credentials sign in: any other valid Vobiz account would
-      // otherwise get a session here, and with it this server's SIP password,
-      // recordings and CDRs, all of which belong to the configured account.
-      let isValid = false;
-      if (serverAccountConfigured()) {
-        isValid = authId === VOBIZ_AUTH_ID && safeEqual(authToken, VOBIZ_AUTH_TOKEN);
-        if (!isValid) console.log(`[backend] Refused sign-in for ${authId}: not this server's Vobiz account`);
-      } else {
-        try {
-          // 405 means the resource exists and rejected the verb, which still
-          // proves the credentials were accepted.
-          const check = await fetch(`${VOBIZ_API_URL}/api/v1/Account/${encodeURIComponent(authId)}/`, {
-            headers: authHeaders,
-          });
-          isValid = check.ok || check.status === 405;
-          if (!isValid) console.log(`[backend] Vobiz rejected ${authId}: HTTP ${check.status}`);
-        } catch (e) {
-          console.error("[backend] Could not reach Vobiz to validate credentials:", e.message);
-          isValid = false;
-        }
-      }
-
-      if (!isValid) {
-        res.writeHead(401, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: "Invalid Vobiz Auth ID or Auth Token." }));
-        return;
-      }
-
+      // Credentials are proven, not assumed: Vobiz must accept the pair.
+      let numberDetails;
       try {
-        const numRes = await fetch(`${VOBIZ_API_URL}/api/v1/Account/${encodeURIComponent(authId)}/numbers`, {
-          headers: authHeaders,
-        });
-        if (numRes.ok) {
-          const numJson = await numRes.json();
-          const items = numJson.objects || numJson.items || [];
-          numbers = items.map((n) => n.e164 || n.number || n.phone_number).filter(Boolean);
-        }
+        numberDetails = await loadAccountNumbers(authId, authToken);
       } catch (e) {
-        console.warn("[backend] Numbers lookup notice:", e.message);
-      }
-
-      if (numbers.length === 0 && VOBIZ_FROM_NUMBER) {
-        numbers.push(VOBIZ_FROM_NUMBER);
-      }
-
-      const selected = numbers[0] || VOBIZ_FROM_NUMBER;
-
-      // Auto-discover endpoints from Vobiz API using the provided Auth credentials
-      let sipUser = VOBIZ_SIP_USER || agentId;
-      // No hardcoded fallback password. A published default password is a
-      // published password, and it was committed in this file.
-      let sipPassword = VOBIZ_SIP_PASSWORD || "";
-      let sipAvailable = false;
-
-      // VOBIZ_SIP_USER and VOBIZ_SIP_PASSWORD are a pair. Discovery used to
-      // replace the configured user with the account's first endpoint while
-      // keeping the configured password, so on any account with more than one
-      // endpoint the softphone registered with the wrong username. Discover only
-      // when no SIP user is configured.
-      if (cleanEnvVar(process.env.VOBIZ_SIP_USER)) {
-        sipAvailable = !!VOBIZ_SIP_PASSWORD;
-      } else try {
-        const endRes = await fetch(`${VOBIZ_API_URL}/api/v1/Account/${encodeURIComponent(authId)}/Endpoint/`, {
-          headers: authHeaders,
-        });
-        if (endRes.ok) {
-          const endJson = await endRes.json();
-          const endpoints = endJson.objects || endJson.items || [];
-          if (endpoints.length > 0) {
-            sipUser = endpoints[0].username || endpoints[0].sip_username || sipUser;
-            sipAvailable = true;
-            console.log(`[backend] Auto-discovered Vobiz SIP endpoint '${sipUser}' for ${authId}`);
-          }
+        if (e.status) {
+          console.log(`[backend] Vobiz refused sign-in for ${authId}: HTTP ${e.status}`);
+          sendJson(res, 401, { ok: false, error: "Invalid Vobiz Auth ID or Auth Token." });
+        } else {
+          console.error(`[backend] Could not reach Vobiz to check ${authId}: ${e.message}`);
+          sendJson(res, 502, { ok: false, error: "Could not reach Vobiz to check those credentials. Try again." });
         }
+        return;
+      }
+
+      const base = getPublicBaseUrl(req);
+      const answerUrl = `${base}/answer`;
+      const hangupUrl = `${base}/hangup-callback`;
+
+      let provisioned;
+      let appId;
+      try {
+        appId = await ensureApplication(authId, authToken, answerUrl, hangupUrl);
+        provisioned = await ensureEndpoint(authId, authToken, agentId, appId);
       } catch (e) {
-        console.warn("[backend] Endpoint discovery notice:", e.message);
+        console.error(`[provision] ${authId}: ${e.message}`);
+        sendJson(res, 502, { ok: false, error: `Signed in to Vobiz, but setting up the softphone failed: ${e.message}` });
+        return;
       }
 
-      const token = newSession(agentId, authId, authToken, numbers, selected);
-      const sessionObj = sessions.get(token);
-      if (sessionObj) {
-        sessionObj.sipUser = sipUser;
-        sessionObj.sipPassword = sipPassword;
+      // The token stays here, in memory, keyed by account. Never on disk, never
+      // in a response, never in a log line.
+      const numbers = numberDetails.map((n) => n.e164);
+      accounts.set(authId, { authToken, numbers, numberDetails, appId, answerUrl });
+
+      // Default to the first number; a returning agent keeps their last pick.
+      const previous = [...sessions.values()].find((o) => o.authId === authId && o.agentId === agentId);
+      const selected = previous && numbers.includes(previous.from) ? previous.from : numbers[0] || "";
+      // A previous sign-in for this agent registered as the same endpoint; its
+      // password was just replaced, so its session is finished.
+      for (const [tok, old] of sessions) {
+        if (old.authId === authId && old.agentId === agentId) sessions.delete(tok);
       }
+      const token = crypto.randomBytes(32).toString("hex");
+      sessions.set(token, {
+        agentId,
+        authId,
+        numbers,
+        from: selected,
+        sipUser: provisioned.username,
+        sipPassword: provisioned.password,
+        createdAt: Date.now(),
+      });
+      sipUsers.set(provisioned.username, { authId, agentId, callerId: selected });
 
-      const cleanUser = String(sipUser).replace(/^sip:/, "").split("@")[0];
-      fromBySipUser.set(cleanUser, selected);
+      console.log(`[backend] Sign-in ok for agent '${agentId}' (${authId}) as ${provisioned.username}. Numbers: ${numbers.length}`);
 
-      console.log(`[backend] Account login ok for agent '${agentId}' (${authId}). Numbers: ${numbers.length}`);
-
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
-          ok: true,
-          success: true,
-          token,
-          numbers,
-          selected,
-          authId,
-          agentId,
-          sipAvailable,
-        })
-      );
+      sendJson(res, 200, {
+        ok: true,
+        success: true,
+        token,
+        numbers,
+        numberDetails,
+        appId,
+        selected,
+        authId,
+        agentId,
+        sipAvailable: true,
+      });
     } catch (err) {
-      console.error("[backend] Login error:", err);
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: err.message }));
+      console.error("[backend] Login error:", err.message);
+      sendJson(res, 500, { error: "Sign-in failed" });
     }
     return;
   }
 
-  // 2b. Dual Login: Mode 2 - SIP Direct Registration Endpoint
+  // 2b. SIP direct: the agent's softphone registers with an existing
+  // endpoint's own SIP username and password, typed into the panel and never
+  // sent here. The backend only records which caller ID that SIP user dials out
+  // with, and which DID rings it, so /answer can route its calls. No account
+  // credentials exist in this mode, so nothing account-owned (recordings, the
+  // number list, inbound attach) is reachable from it.
+  //
+  // The caller ID is format-checked only. This backend cannot prove ownership
+  // without the account API; Vobiz itself refuses a caller ID the endpoint's
+  // account does not own.
   if (pathname === "/login-sip" && method === "POST") {
     try {
       const body = await readJsonBody(req);
-      const { sipUser, callerId } = body;
-      if (!sipUser || !callerId) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "sipUser and callerId are required" }));
+      const cleanUser = String(body.sipUser || "").trim().replace(/^sip:/, "").split("@")[0];
+      const callerId = cleanPhone(body.callerId);
+      if (!/^[A-Za-z0-9]{1,64}$/.test(cleanUser)) {
+        sendJson(res, 400, { error: "Enter the endpoint's SIP username (letters and digits only)." });
         return;
       }
-      const cleanUser = String(sipUser).replace(/^sip:/, "").split("@")[0];
-
-      // The caller ID is what the customer's handset displays and what the
-      // carrier bills against. Accepting an arbitrary string here let anyone
-      // who could reach the tunnel set the number this account dials out as.
-      // An empty owned list refuses rather than accepts: "could not check" is
-      // not "allowed".
-      if (cachedAccountNumbers.length === 0) await refreshAccountNumbers();
-      if (!ownedCallerId(callerId)) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({ error: `${callerId} is not a number on this Vobiz account, so it cannot be a caller ID.` })
-        );
+      if (!callerId) {
+        sendJson(res, 400, { error: "Enter the caller ID as a full number with country code, e.g. +91…" });
         return;
       }
-
-      fromBySipUser.set(cleanUser, callerId);
-
-      // A session scoped to SIP-direct mode. It carries no account credentials,
-      // and /api/agent-sip refuses it: an agent signing in this way already
-      // holds their own SIP password, and serving the account's password to
-      // anyone who can name an endpoint would be the /agent hole by another door.
-      const token = newSession(cleanUser, null, null, [callerId], callerId);
-      sessions.get(token).mode = "sip";
-
-      console.log(`[backend] SIP direct caller ID registered: ${cleanUser} -> ${callerId}`);
-
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true, success: true, token, sipUser: cleanUser, callerId }));
+      const existing = sipUsers.get(cleanUser);
+      if (existing && existing.mode !== "sip") {
+        // An account sign-in provisioned this endpoint; its routing is not
+        // something an unauthenticated request may rewrite.
+        sendJson(res, 409, { error: "That SIP user belongs to a Vobiz account sign-in on this server." });
+        return;
+      }
+      for (const [u, a] of sipUsers) {
+        if (u !== cleanUser && a.mode === "sip" && a.inboundNumber === callerId) {
+          sendJson(res, 409, { error: `${callerId} is already in use by another SIP-direct agent on this server.` });
+          return;
+        }
+      }
+      for (const [tok, old] of sessions) {
+        if (old.mode === "sip" && old.sipUser === cleanUser) sessions.delete(tok);
+      }
+      sipUsers.set(cleanUser, { authId: null, agentId: cleanUser, callerId, inboundNumber: callerId, mode: "sip" });
+      const token = crypto.randomBytes(32).toString("hex");
+      sessions.set(token, {
+        mode: "sip",
+        agentId: cleanUser,
+        authId: null,
+        numbers: [callerId],
+        from: callerId,
+        sipUser: cleanUser,
+        createdAt: Date.now(),
+      });
+      console.log(`[backend] SIP-direct sign-in: ${cleanUser} -> caller ID ${callerId}`);
+      sendJson(res, 200, { ok: true, success: true, token, sipUser: cleanUser, callerId, mode: "sip" });
     } catch (err) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: err.message }));
+      sendJson(res, 500, { error: "SIP-direct sign-in failed" });
     }
     return;
   }
 
-  // 2c. Session Query Endpoint
-  // The bearer token is the only thing that identifies a session.
-  //
-  // Two shapes to avoid here: answering /session/<agentId> from any live
-  // session whose agent id matches, and answering a request with no session at
-  // all as `loggedIn: true` because the server happens to have credentials
-  // configured. Either makes the whole panel unauthenticated. The path form is
-  // kept so older widgets do not 404.
+  // 2c. Session Query Endpoint — the bearer token is the only proof.
   if ((pathname === "/session" || pathname.startsWith("/session/")) && method === "GET") {
     const s = getSession(req);
     if (s) {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
-          loggedIn: true,
-          agentId: s.agentId,
-          authId: s.authId,
-          numbers: s.numbers,
-          from: s.from,
-        })
-      );
+      sendJson(res, 200, {
+        loggedIn: true,
+        mode: s.mode === "sip" ? "sip" : "account",
+        agentId: s.agentId,
+        authId: s.authId,
+        numbers: s.numbers,
+        from: s.from,
+      });
       return;
     }
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ loggedIn: false }));
+    sendJson(res, 200, { loggedIn: false });
     return;
   }
 
@@ -866,109 +1064,113 @@ const server = http.createServer(async (req, res) => {
   if (pathname === "/logout" && method === "POST") {
     const header = (req.headers && req.headers.authorization) || "";
     const token = header.startsWith("Bearer ") ? header.slice(7) : "";
-    if (token) sessions.delete(token);
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ok: true, success: true }));
+    const s = token ? sessions.get(token) : null;
+    if (s) {
+      sessions.delete(token);
+      const entry = sipUsers.get(s.sipUser);
+      if (entry && entry.authId === s.authId && entry.agentId === s.agentId) sipUsers.delete(s.sipUser);
+    }
+    sendJson(res, 200, { ok: true, success: true });
     return;
   }
 
-  // 2e. Select Outgoing Caller ID
+  // 2e. Select Outgoing Caller ID — must be a number on the signed-in account.
   if (pathname === "/select-number" && method === "POST") {
-    if (!requireSession(req, res)) return;
+    if (!requireAccountSession(req, res)) return;
     try {
       const body = await readJsonBody(req);
       const s = getSession(req);
-      if (cachedAccountNumbers.length === 0) await refreshAccountNumbers();
-      const number = ownedCallerId(body.number);
+      const number = ownedCallerId(s.authId, body.number);
       if (!number) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: `${body.number} is not a number on this Vobiz account, so it cannot be a caller ID.` }));
+        sendJson(res, 400, { error: `${body.number} is not a number on this Vobiz account, so it cannot be a caller ID.` });
         return;
       }
       s.from = number;
-      // Map the caller ID to the SIP user this session actually registers as,
-      // which is what /answer sees in From — not to whatever agent id was sent.
-      const sessionSipUser = s.mode === "sip" ? s.agentId : s.sipUser || VOBIZ_SIP_USER;
-      const cleanUser = String(sessionSipUser || "").replace(/^sip:/, "").split("@")[0];
-      if (cleanUser) fromBySipUser.set(cleanUser, number);
-
-      console.log(`[backend] Outbound Caller ID updated to ${number} for ${cleanUser}`);
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true, selected: number }));
+      const entry = sipUsers.get(s.sipUser);
+      if (entry) entry.callerId = number;
+      console.log(`[backend] Outbound caller ID for ${s.sipUser} is now ${number}`);
+      sendJson(res, 200, { ok: true, selected: number });
     } catch (err) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: err.message }));
+      sendJson(res, 500, { error: err.message });
     }
     return;
   }
 
-  // 2f. SIP Credentials for Softphone Registration
-  // SIP credentials for the softphone to register with.
-  //
-  // Behind the session deliberately: SIP credentials let anyone place calls
-  // billed to this account. An unknown agent id is refused rather than filled in
-  // with a default, and there is no hardcoded fallback password — a default
-  // password in a published file is a published password.
+  // 2e-bis. Enable inbound calls on one of the account's numbers.
+  // Explicit only: attaching moves the number off whatever application it is
+  // on now, so it never happens as a side effect of signing in.
+  if (pathname === "/api/inbound/enable" && method === "POST") {
+    if (!requireAccountSession(req, res)) return;
+    try {
+      const body = await readJsonBody(req);
+      const s = getSession(req);
+      const acct = accounts.get(s.authId);
+      const number = ownedCallerId(s.authId, body.number || s.from);
+      if (!acct || !number) {
+        sendJson(res, 400, { error: "Choose a number on this Vobiz account first." });
+        return;
+      }
+      const digits = number.replace(/\D/g, "");
+      const r = await vobiz(
+        s.authId,
+        acct.authToken,
+        "POST",
+        `/numbers/%2B${digits}/application`,
+        JSON.stringify({ application_id: acct.appId })
+      );
+      if (!r.ok) {
+        console.error(`[backend] ${s.authId}: attaching ${number} to ${acct.appId} failed: HTTP ${r.status}`);
+        sendJson(res, 502, { error: `Vobiz refused to attach ${number} (HTTP ${r.status})` });
+        return;
+      }
+      console.log(`[backend] ${s.authId}: inbound enabled on ${number} -> application ${acct.appId}`);
+      sendJson(res, 200, { ok: true, number });
+    } catch (err) {
+      sendJson(res, 500, { error: err.message });
+    }
+    return;
+  }
+
+  // 2f. SIP credentials for this session's softphone registration.
   if ((pathname === "/api/agent-sip" || pathname === "/agent" || pathname.startsWith("/agent/")) && method === "GET") {
     const s = getSession(req);
     if (!s) {
-      res.writeHead(401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Sign in first" }));
+      sendJson(res, 401, { error: "Sign in first" });
       return;
     }
     if (s.mode === "sip") {
-      res.writeHead(403, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({ error: "SIP-direct sessions register with the password the agent supplied, not this one." })
-      );
+      sendJson(res, 403, { error: "SIP-direct sessions register with the password the agent typed; this server holds none." });
       return;
     }
-    const agentObj = getAgent(s.agentId || "admin");
-    const effectiveSipUser = s.sipUser || VOBIZ_SIP_USER || agentObj.sipUser;
-    const effectivePassword = s.sipPassword || VOBIZ_SIP_PASSWORD || "";
-    if (!effectiveSipUser || !effectivePassword) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "VOBIZ_SIP_USER / VOBIZ_SIP_PASSWORD are not configured on this server" }));
+    if (!s.sipUser || !s.sipPassword) {
+      sendJson(res, 500, { error: "This session has no SIP endpoint. Sign out and sign in again." });
       return;
     }
-    const sipUserClean = effectiveSipUser.includes("@") ? effectiveSipUser : `${effectiveSipUser}@${VOBIZ_REGISTRAR}`;
-
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        displayName: agentObj.name || s.agentId,
-        sipUser: sipUserClean,
-        sipPassword: effectivePassword,
-        registrarUrl: `wss://${VOBIZ_REGISTRAR}:5063/`,
-      })
-    );
+    const agentObj = getAgent(s.agentId);
+    sendJson(res, 200, {
+      displayName: agentObj.name || s.agentId,
+      sipUser: `${s.sipUser}@${VOBIZ_REGISTRAR}`,
+      sipPassword: s.sipPassword,
+      registrarUrl: `wss://${VOBIZ_REGISTRAR}:5063/`,
+    });
     return;
   }
 
   // 2g. List Agents
   if (pathname === "/api/agents" && method === "GET") {
     if (!requireAccountSession(req, res)) return;
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(getAllAgents()));
+    sendJson(res, 200, getAllAgents());
     return;
   }
 
-  // 2h. /api/calls/start no longer originates calls.
-  //
-  // It used to POST /Call/ to ring the customer from the account DID, with
-  // /answer as the answer URL. That is the design that cannot work: /answer
-  // sees a PSTN From, takes the inbound branch and bridges with <Dial><User>,
-  // and the customer answers into ringback and then "agent offline". The
-  // softphone is the A leg: it sends the INVITE itself once registered.
+  // 2h. /api/calls/start no longer originates calls. The softphone is the A
+  // leg: it sends the INVITE itself once registered.
   if (pathname === "/api/calls/start" && method === "POST") {
     if (!requireAccountSession(req, res)) return;
-    res.writeHead(409, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        ok: false,
-        error: "Calls are placed by the softphone over WebRTC. Wait for the status to read Ready, then dial.",
-      })
-    );
+    sendJson(res, 409, {
+      ok: false,
+      error: "Calls are placed by the softphone over WebRTC. Wait for the status to read Ready, then dial.",
+    });
     return;
   }
 
@@ -980,40 +1182,38 @@ const server = http.createServer(async (req, res) => {
       const s = getSession(req);
       const callUuid = body.callUuid || `call_${Date.now()}`;
       const durationSeconds = Number(body.durationSeconds || 0);
-      const agentId = body.agentId || (s ? s.agentId : "admin");
-      const direction = body.direction || "Outbound";
-      const from = body.from || (s ? s.from : VOBIZ_FROM_NUMBER);
-      const to = body.to || "";
-      const hangupCause = body.hangupCause || "NORMAL_CLEARING";
 
       let rec = callsByUuid.get(callUuid);
+      if (rec && rec.authId !== s.authId) {
+        sendJson(res, 404, { error: "No such call on this account" });
+        return;
+      }
       if (!rec) {
         rec = {
           callUuid,
-          direction,
-          agentSipUser: agentId,
-          from,
-          to,
+          authId: s.authId,
+          agentId: s.agentId,
+          direction: body.direction || "Outbound",
+          from: ownedCallerId(s.authId, body.from) || s.from,
+          to: body.to || "",
           startedAt: Date.now() - durationSeconds * 1000,
         };
       }
       rec.duration = durationSeconds;
       rec.endedAt = Date.now();
-      rec.hangupCause = hangupCause;
+      rec.hangupCause = body.hangupCause || "NORMAL_CLEARING";
       rec.dialStatus = "completed";
       rememberCall(rec);
 
-      console.log(`[backend] 📴 Ended API call session: ${callUuid} (${durationSeconds}s). Syncing ClickUp CDR...`);
-
       const task = await createClickUpCallTask(
         {
+          authId: rec.authId,
           callUuid: rec.callUuid,
           direction: rec.direction,
           from: rec.from,
           to: rec.to,
-          agentId: rec.agentSipUser,
+          agentId: rec.agentId,
           durationSeconds: rec.duration,
-          recordingUrl: rec.recordingUrl || "",
           recordingId: rec.recordingId || "",
           hangupCause: rec.hangupCause,
           status: "COMPLETE",
@@ -1021,16 +1221,19 @@ const server = http.createServer(async (req, res) => {
         getPublicBaseUrl(req)
       );
 
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true, success: true, task, record: rec }));
+      sendJson(res, 200, { ok: true, success: true, task, record: rec });
     } catch (err) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: err.message }));
+      sendJson(res, 500, { error: err.message });
     }
     return;
   }
 
   // 3. THE BROWSER-AS-A-LEG ANSWER CALLBACK: GET/POST /answer, /fallback, /inbound-answer
+  //
+  // Multi-tenant: the webhook is matched to an account by who is calling.
+  //   outbound — From is sip:<user>@…, and the SIP user maps to the agent who
+  //              signed in with it;
+  //   inbound  — To is a DID, found among the signed-in accounts' numbers.
   if (
     (pathname === "/answer" || pathname === "/fallback" || pathname === "/inbound-answer") &&
     (method === "GET" || method === "POST")
@@ -1044,20 +1247,22 @@ const server = http.createServer(async (req, res) => {
       const to = String(params.To || params.to || "");
       const routeType = String(params.RouteType || params.routetype || "").toLowerCase();
 
-      // Browser is the A leg when 'from' is a sip: URI, routeType is sip, or
-      // From is the bare username of an endpoint this server knows.
-      const knownSipUsers = new Set([VOBIZ_SIP_USER, ...fromBySipUser.keys()].filter(Boolean));
-      const fromBrowser = from.startsWith("sip:") || routeType === "sip" || knownSipUsers.has(from);
+      const bareFrom = from.replace(/^sip:/, "").split("@")[0];
+      const fromBrowser = from.startsWith("sip:") || routeType === "sip" || sipUsers.has(bareFrom);
 
       const publicBaseUrl = getPublicBaseUrl(req);
       const dialStatusUrl = `${publicBaseUrl}/dial-status`;
       const recordCallbackUrl = `${publicBaseUrl}/recording-ready`;
-
       const recordXml = `<Record fileFormat="mp3" recordSession="true" maxLength="3600" playBeep="false" redirect="false" callbackUrl="${recordCallbackUrl}" callbackMethod="POST"/>`;
 
       if (fromBrowser) {
-        // OUTBOUND CALL from agent browser to customer PSTN
-        const sipUser = (from.match(/^sip:([^@]+)@/) || [])[1] || (knownSipUsers.has(from) ? from : "") || VOBIZ_SIP_USER || "admin";
+        // OUTBOUND: an agent's softphone calling a customer.
+        const agent = sipUsers.get(bareFrom);
+        if (!agent) {
+          console.warn(`[backend] /answer: outbound from unknown SIP user '${bareFrom}'; hanging up`);
+          sendXml(res, politeHangup("This phone is not signed in. Please sign in to the ClickUp softphone and try again."));
+          return;
+        }
         const sipHeaderCallerId =
           params["SIPHeader_X-VH-Caller-ID"] ||
           params["SIPHeader_X-PH-Caller-ID"] ||
@@ -1067,73 +1272,111 @@ const server = http.createServer(async (req, res) => {
           params.caller_id;
 
         // The header comes from the browser, so it is a request, not a fact:
-        // only a number the account owns is used as the caller ID.
-        if (cachedAccountNumbers.length === 0) await refreshAccountNumbers();
+        // only a number this agent's account owns is used as the caller ID.
+        // SIP direct has no account to check against: the caller ID is the one
+        // typed at sign-in (format-checked), and Vobiz enforces ownership.
+        // Per-SIP-user state set from the panel, overridden by the X-VH-Caller-ID
+        // header on the INVITE when that is a strict E.164 number.
+        const headerCallerId = STRICT_E164.test(toE164(sipHeaderCallerId)) ? toE164(sipHeaderCallerId) : "";
         const callerId =
-          ownedCallerId(sipHeaderCallerId) || fromBySipUser.get(sipUser) || toE164(VOBIZ_FROM_NUMBER) || VOBIZ_FROM_NUMBER;
+          agent.mode === "sip"
+            ? headerCallerId || agent.callerId
+            : ownedCallerId(agent.authId, headerCallerId) || ownedCallerId(agent.authId, agent.callerId);
+        if (!callerId) {
+          console.warn(`[backend] /answer: ${agent.authId} has no number to call from; hanging up`);
+          sendXml(res, politeHangup("This account has no phone number to call from. Add a number in the Vobiz console."));
+          return;
+        }
         const destination = to.replace(/[^\d+]/g, "");
 
         rememberCall({
           callUuid,
+          authId: agent.authId,
+          agentId: agent.agentId,
+          agentSipUser: bareFrom,
           direction: "Outbound",
-          agentSipUser: sipUser,
           from: callerId,
           to: destination,
           startedAt: Date.now(),
         });
 
-        console.log(`[backend] 📞 Browser A-leg: Outbound call to ${destination} via callerId ${callerId}`);
+        console.log(`[backend] 📞 Browser A-leg (${agent.authId || "sip-direct"}/${agent.agentId}): outbound to ${destination} via callerId ${callerId}`);
 
-        const xml = `<?xml version="1.0" encoding="UTF-8"?>
+        sendXml(
+          res,
+          `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   ${recordXml}
-  <Dial callerId="${callerId}" timeout="30" timeLimit="14400" action="${dialStatusUrl}" method="POST" redirect="false">
-    <Number>${destination}</Number>
+  <Dial callerId="${xmlEscape(callerId)}" timeout="30" timeLimit="14400" action="${dialStatusUrl}" method="POST" redirect="false">
+    <Number>${xmlEscape(destination)}</Number>
   </Dial>
-</Response>`;
-
-        res.writeHead(200, { "Content-Type": "application/xml" });
-        res.end(xml);
+</Response>`
+        );
         return;
       }
 
-      // INBOUND CALL from customer PSTN to account DID -> bridge to agent SIP softphone
-      const callerId = toE164(to) || VOBIZ_FROM_NUMBER;
-      let targetSipUser = VOBIZ_SIP_USER || "admin";
-      for (const s of sessions.values()) {
-        if (s.sipUser) {
-          targetSipUser = s.sipUser.split("@")[0].replace(/^sip:/, "");
-          break;
+      // INBOUND: a customer calling one of a signed-in account's DIDs.
+      // Vobiz names the account on the webhook as ParentAuthID; that is the
+      // primary key. Without it (or for an account nobody signed in with), the
+      // dialled number is looked up among the signed-in accounts' numbers.
+      const dialled = toE164(to);
+      const parentAuthId = String(params.ParentAuthID || params.parentauthid || "");
+      let authId = parentAuthId && accounts.has(parentAuthId) ? parentAuthId : "";
+      if (!authId) {
+        for (const [id, acct] of accounts) {
+          if (dialled && acct.numbers.includes(dialled)) {
+            authId = id;
+            break;
+          }
         }
+      }
+      // Account sign-ins own their numbers first; otherwise a SIP-direct agent
+      // whose caller ID is the dialled number takes the call.
+      const targets = authId
+        ? [...sipUsers.entries()].filter(([, a]) => a.mode !== "sip" && a.authId === authId).map(([u]) => u)
+        : [...sipUsers.entries()].filter(([, a]) => a.mode === "sip" && dialled && a.inboundNumber === dialled).map(([u]) => u);
+      if (!authId && targets.length === 0) {
+        console.warn(`[backend] /answer: inbound to ${dialled || "(none)"} matches no signed-in account or agent; hanging up`);
+        sendXml(res, politeHangup("Sorry, this number cannot take calls right now. Goodbye."));
+        return;
+      }
+
+      if (targets.length === 0) {
+        console.warn(`[backend] /answer: inbound to ${dialled} (${authId}) but no agent is signed in; hanging up`);
+        sendXml(res, politeHangup("Sorry, no one is available to take your call right now. Please try again later. Goodbye."));
+        return;
       }
 
       rememberCall({
         callUuid,
+        authId: authId || null,
+        agentId: targets.length === 1 ? sipUsers.get(targets[0]).agentId : "",
+        agentSipUser: targets.join(","),
         direction: "Inbound",
-        agentSipUser: targetSipUser,
         from,
-        to: callerId,
+        to: dialled,
         startedAt: Date.now(),
       });
 
-      console.log(`[backend] 🔔 Call answered: ${from} to ${callerId} -> greeting & bridging to sip:${targetSipUser}@${VOBIZ_REGISTRAR}`);
+      console.log(`[backend] 🔔 Inbound ${from} -> ${dialled} (${authId || "sip-direct"}): ringing ${targets.length} agent(s)`);
 
-      const xml = `<?xml version="1.0" encoding="UTF-8"?>
+      const users = targets.map((u) => `    <User>sip:${xmlEscape(u)}@${VOBIZ_REGISTRAR}</User>`).join("\n");
+      sendXml(
+        res,
+        `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   ${recordXml}
-  <Dial callerId="${callerId}" timeout="20" action="${dialStatusUrl}" method="POST" redirect="false">
-    <User>sip:${targetSipUser}@${VOBIZ_REGISTRAR}</User>
+  <Dial callerId="${xmlEscape(dialled)}" timeout="20" action="${dialStatusUrl}" method="POST" redirect="false">
+${users}
   </Dial>
   <Speak>Sorry, no one is available to take your call right now. Please try again later. Goodbye.</Speak>
-</Response>`;
-
-      res.writeHead(200, { "Content-Type": "application/xml" });
-      res.end(xml);
+</Response>`
+      );
       return;
     } catch (err) {
-      console.error("[backend] Error in /answer:", err);
+      console.error("[backend] Error in /answer:", err.message);
       res.writeHead(500, { "Content-Type": "text/plain" });
-      res.end(err.message);
+      res.end("error");
     }
     return;
   }
@@ -1150,7 +1393,7 @@ const server = http.createServer(async (req, res) => {
 
       console.log(`[backend] DIAL STATUS: call=${callUuid} status=${dialStatus} bleg=${bleg} dur=${duration}s`);
 
-      let rec = callsByUuid.get(callUuid);
+      const rec = callsByUuid.get(callUuid);
       if (rec) {
         rec.dialStatus = dialStatus;
         rec.hangupCause = d.DialHangupCause || "NORMAL_CLEARING";
@@ -1158,17 +1401,16 @@ const server = http.createServer(async (req, res) => {
         rec.duration = duration;
         rec.endedAt = Date.now();
 
-        // Create / update ClickUp task
         await syncCallTask(
           rec,
           {
+            authId: rec.authId,
             callUuid,
             direction: rec.direction || "Outbound",
             from: rec.from,
             to: rec.to,
-            agentId: rec.agentSipUser || "admin",
+            agentId: rec.agentId,
             durationSeconds: duration,
-            recordingUrl: rec.recordingUrl || "",
             recordingId: rec.recordingId || "",
             hangupCause: rec.hangupCause,
             status: dialStatus === "answered" || dialStatus === "completed" ? "COMPLETE" : dialStatus,
@@ -1177,10 +1419,9 @@ const server = http.createServer(async (req, res) => {
         );
       }
 
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true }));
+      sendJson(res, 200, { ok: true });
     } catch (err) {
-      console.error("[backend] Error in /dial-status:", err);
+      console.error("[backend] Error in /dial-status:", err.message);
       res.writeHead(200);
       res.end();
     }
@@ -1200,16 +1441,14 @@ const server = http.createServer(async (req, res) => {
       const recordUrl = d.RecordUrl || d.record_url || d.recording_url || d.RecordFile || "";
       const recordingDuration = Number(d.RecordingDuration || d.duration || 0);
 
-      console.log(`[backend] 🎧 RECORDING READY: call=${callUuid} id=${recordingId} url=${recordUrl}`);
+      console.log(`[backend] 🎧 RECORDING READY: call=${callUuid} id=${recordingId}`);
 
-      // Only calls this server answered get a task. This route is reachable by
-      // anyone who can reach the tunnel, so an unknown CallUUID is acknowledged
-      // and ignored rather than turned into a ClickUp task.
+      // Only calls this server answered get a task, and the account is the one
+      // that call belongs to — never taken from the webhook body.
       const rec = callsByUuid.get(callUuid);
       if (!rec) {
         console.warn(`[backend] recording callback for unknown call ${callUuid}; ignored`);
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
+        sendJson(res, 200, { ok: true });
         return;
       }
 
@@ -1218,31 +1457,27 @@ const server = http.createServer(async (req, res) => {
       rec.recordingDuration = recordingDuration;
       callRecordings.set(callUuid, rec);
 
-      const publicBaseUrl = getPublicBaseUrl(req);
-
-      // Create or update ClickUp call task with recording link
       await syncCallTask(
         rec,
         {
+          authId: rec.authId,
           callUuid,
           direction: rec.direction,
           from: rec.from,
           to: rec.to,
-          agentId: rec.agentSipUser,
+          agentId: rec.agentId,
           durationSeconds: rec.duration || recordingDuration || 0,
-          recordingUrl: recordUrl,
-          recordingId: recordingId,
+          recordingId,
           hangupCause: rec.hangupCause || "NORMAL_CLEARING",
         },
-        publicBaseUrl
+        getPublicBaseUrl(req)
       );
 
       // The task result is not echoed: it carries a freshly signed playback
       // link, and this route is unauthenticated.
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true }));
+      sendJson(res, 200, { ok: true });
     } catch (err) {
-      console.error("[backend] Error in recording webhook:", err);
+      console.error("[backend] Error in recording webhook:", err.message);
       res.writeHead(200);
       res.end();
     }
@@ -1262,41 +1497,34 @@ const server = http.createServer(async (req, res) => {
         callInfo.duration = duration;
         callInfo.hangupCause = hangupCause;
       }
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "success" }));
+      sendJson(res, 200, { status: "success" });
     } catch (err) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: err.message }));
+      sendJson(res, 500, { error: err.message });
     }
     return;
   }
 
-  // 7. Recordings List Endpoint: GET /recordings or GET /api/recordings
+  // 7. Recordings List: the signed-in account's recordings, with its own credentials.
   if ((pathname === "/recordings" || pathname === "/api/recordings") && method === "GET") {
     if (!requireAccountSession(req, res)) return;
     try {
+      const s = getSession(req);
+      const acct = accounts.get(s.authId);
       const publicBaseUrl = getPublicBaseUrl(req);
       const limit = Math.min(Number(parsedUrl.query.limit || 15), 50);
       let recordings = [];
 
-      if (VOBIZ_AUTH_ID && VOBIZ_AUTH_TOKEN && !VOBIZ_AUTH_ID.includes("YOUR_")) {
+      if (acct) {
         try {
-          const r = await fetch(`${VOBIZ_API_URL}/api/v1/Account/${VOBIZ_AUTH_ID}/Recording/?limit=${limit}`, {
-            headers: {
-              "X-Auth-ID": VOBIZ_AUTH_ID,
-              "X-Auth-Token": VOBIZ_AUTH_TOKEN,
-              Accept: "application/json",
-            },
-          });
+          const r = await vobiz(s.authId, acct.authToken, "GET", `/Recording/?limit=${limit}`);
           if (r.ok) {
-            const data = await r.json();
-            const objects = data.objects || data.items || [];
+            const objects = (r.json && (r.json.objects || r.json.items)) || [];
             recordings = objects.map((o) => ({
               recording_id: o.recording_id,
               add_time: o.add_time,
               rounded_recording_duration: o.rounded_recording_duration,
               call_uuid: o.call_uuid,
-              playUrl: signRecordingUrl(o.recording_id, publicBaseUrl),
+              playUrl: signRecordingUrl(s.authId, String(o.recording_id), publicBaseUrl),
             }));
           }
         } catch (e) {
@@ -1304,53 +1532,58 @@ const server = http.createServer(async (req, res) => {
         }
       }
 
-      if (recordings.length === 0 && (callRecordings.size > 0 || recentCalls.length > 0)) {
-        const pool = callRecordings.size > 0 ? Array.from(callRecordings.values()) : recentCalls;
+      if (recordings.length === 0) {
+        const pool = (callRecordings.size > 0 ? Array.from(callRecordings.values()) : recentCalls).filter(
+          (c) => c.authId === s.authId
+        );
         recordings = pool.slice(0, limit).map((c) => ({
           recording_id: c.recordingId || c.callUuid,
           add_time: new Date(c.startedAt || Date.now()).toLocaleTimeString(),
-          rounded_recording_duration: c.duration || c.recordingDuration || 35,
+          rounded_recording_duration: c.duration || c.recordingDuration || 0,
           call_uuid: c.callUuid,
-          playUrl: c.recordingId ? signRecordingUrl(c.recordingId, publicBaseUrl) : "",
+          playUrl: c.recordingId ? signRecordingUrl(s.authId, c.recordingId, publicBaseUrl) : "",
         }));
       }
 
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ recordings, objects: recordings }));
+      sendJson(res, 200, { recordings, objects: recordings });
     } catch (err) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ recordings: [], error: err.message }));
+      sendJson(res, 500, { recordings: [], error: err.message });
     }
     return;
   }
 
-  // 8. Play Recording Endpoint: GET /play-recording?callUuid=...
+  // 8. Play Recording Endpoint: GET /play-recording?callUuid=... (session only)
   if (pathname === "/play-recording" && method === "GET") {
+    if (!requireAccountSession(req, res)) return;
+    const s = getSession(req);
     const callUuid = parsedUrl.query.callUuid;
-    const publicBaseUrl = getPublicBaseUrl(req);
     const rec = callUuid ? callRecordings.get(callUuid) || callsByUuid.get(callUuid) : null;
-    if (rec && rec.recordingId) {
-      res.writeHead(302, { Location: signRecordingUrl(rec.recordingId, publicBaseUrl) });
+    if (rec && rec.recordingId && rec.authId === s.authId) {
+      res.writeHead(302, { Location: signRecordingUrl(rec.authId, rec.recordingId, getPublicBaseUrl(req)) });
       res.end();
       return;
     }
-    res.writeHead(404, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Recording not found for call" }));
+    sendJson(res, 404, { error: "Recording not found for call" });
     return;
   }
 
-  // 9. HMAC Signed Recording Audio Stream: GET /recording-audio/:recordingId
+  // 9. HMAC Signed Recording Audio Stream: GET /recording-audio/:recordingId?a=<authId>&exp=&sig=
   if (pathname.startsWith("/recording-audio/") && method === "GET") {
     const recordingId = decodeURIComponent(pathname.slice("/recording-audio/".length));
-    const { exp, sig } = parsedUrl.query;
-    const viewer = getSession(req);
-    const accountViewer = viewer && viewer.mode !== "sip";
-    if (!verifyRecordingSignature(recordingId, exp, sig) && !accountViewer) {
-      res.writeHead(403, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Invalid or expired playback signature" }));
+    const { a, exp, sig } = parsedUrl.query;
+    let authId = "";
+    if (verifyRecordingSignature(String(a || ""), recordingId, exp, sig)) {
+      authId = String(a);
+    } else {
+      // A signed-in agent may play their own account's recordings unsigned.
+      const viewer = getSession(req);
+      if (viewer && viewer.mode !== "sip" && viewer.authId && (!a || a === viewer.authId)) authId = viewer.authId;
+    }
+    if (!authId) {
+      sendJson(res, 403, { error: "Invalid or expired playback signature" });
       return;
     }
-    await streamRecordingById(recordingId, res);
+    await streamRecordingById(authId, recordingId, res);
     return;
   }
 
@@ -1406,55 +1639,33 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 12. Live CDR Sync Endpoint: GET/POST /sync-recent-cdrs
+  // 12. Live CDR Sync Endpoint: GET/POST /sync-recent-cdrs — the signed-in account's CDRs.
   if (pathname === "/sync-recent-cdrs" && (method === "GET" || method === "POST")) {
     if (!requireAccountSession(req, res)) return;
-    console.log(`[backend] Fetching live CDRs & recordings from Vobiz API for account ${VOBIZ_AUTH_ID}...`);
-    const publicBaseUrl = getPublicBaseUrl(req);
-
-    if (!VOBIZ_AUTH_ID || !VOBIZ_AUTH_TOKEN || VOBIZ_AUTH_ID.includes("YOUR_")) {
-      // Simulate CDR sync if not configured
-      const mockCdrTask = await createClickUpCallTask(
-        {
-          callUuid: `cdr_sync_${Date.now()}`,
-          direction: "Outbound",
-          from: VOBIZ_FROM_NUMBER,
-          to: "+15550199999",
-          agentId: "admin",
-          durationSeconds: 48,
-          recordingUrl: "sample",
-          hangupCause: "NORMAL_CLEARING",
-        },
-        publicBaseUrl
-      );
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
-          status: "success",
-          totalFetched: 1,
-          syncedTasks: [{ uuid: `cdr_sync_${Date.now()}`, clickUpTask: mockCdrTask }],
-        })
-      );
+    const s = getSession(req);
+    const acct = accounts.get(s.authId);
+    if (!acct) {
+      sendJson(res, 409, { error: "Sign in again to sync CDRs." });
       return;
     }
+    console.log(`[backend] Fetching recent CDRs from Vobiz for ${s.authId}...`);
+    const publicBaseUrl = getPublicBaseUrl(req);
 
     try {
-      const headers = { "X-Auth-ID": VOBIZ_AUTH_ID, "X-Auth-Token": VOBIZ_AUTH_TOKEN };
-      const cdrRes = await fetch(`${VOBIZ_API_URL}/api/v1/Account/${VOBIZ_AUTH_ID}/cdr/recent?limit=5`, { headers });
-      const cdrJson = await cdrRes.json();
-      const cdrs = cdrRes.ok && cdrJson.data ? cdrJson.data : [];
+      const r = await vobiz(s.authId, acct.authToken, "GET", "/cdr/recent?limit=5");
+      const cdrs = r.ok && r.json && Array.isArray(r.json.data) ? r.json.data : [];
 
       const syncResults = [];
       for (const cdr of cdrs) {
         const task = await createClickUpCallTask(
           {
+            authId: s.authId,
             callUuid: cdr.uuid,
             direction: cdr.call_direction || "Outbound",
-            from: cdr.caller_id_number || VOBIZ_FROM_NUMBER,
+            from: cdr.caller_id_number || "",
             to: cdr.destination_number || "",
-            agentId: "admin",
+            agentId: s.agentId,
             durationSeconds: parseInt(cdr.duration || 0, 10),
-            recordingUrl: "",
             hangupCause: cdr.hangup_cause || "NORMAL_CLEARING",
           },
           publicBaseUrl
@@ -1462,11 +1673,9 @@ const server = http.createServer(async (req, res) => {
         syncResults.push({ uuid: cdr.uuid, clickUpTask: task });
       }
 
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "success", totalFetched: cdrs.length, syncedTasks: syncResults }));
+      sendJson(res, 200, { status: "success", totalFetched: cdrs.length, syncedTasks: syncResults });
     } catch (err) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: err.message }));
+      sendJson(res, 500, { error: err.message });
     }
     return;
   }
@@ -1475,42 +1684,36 @@ const server = http.createServer(async (req, res) => {
   if (pathname === "/test-simulated-call" && method === "POST") {
     if (!requireAccountSession(req, res)) return;
     try {
+      const s = getSession(req);
       const body = await readJsonBody(req);
       const direction = body.direction || "outbound";
-      const from = body.from || VOBIZ_FROM_NUMBER;
+      const from = body.from || s.from || "";
       const to = body.to || "+15550199999";
       const durationSeconds = parseInt(body.duration || body.Duration || 45, 10);
-      const agentId = body.agentId || "admin";
       const callUuid = body.callUuid || `sim_${Date.now()}`;
-      const recordingUrl = body.recordingUrl || "";
-      const publicBaseUrl = getPublicBaseUrl(req);
 
       const clickUpTask = await createClickUpCallTask(
         {
+          authId: s.authId,
           callUuid,
           direction,
           from,
           to,
-          agentId,
+          agentId: s.agentId,
           durationSeconds,
-          recordingUrl,
           hangupCause: body.hangupCause || "NORMAL_CLEARING",
         },
-        publicBaseUrl
+        getPublicBaseUrl(req)
       );
 
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
-          status: "success",
-          message: `Simulated ${direction} call logged to ClickUp`,
-          callUuid,
-          clickUpTask,
-        })
-      );
+      sendJson(res, 200, {
+        status: "success",
+        message: `Simulated ${direction} call logged to ClickUp`,
+        callUuid,
+        clickUpTask,
+      });
     } catch (err) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: err.message }));
+      sendJson(res, 500, { error: err.message });
     }
     return;
   }
@@ -1571,7 +1774,7 @@ server.listen(PORT, () => {
   console.log(`Local URL:             http://localhost:${PORT}`);
   console.log(`Public Base:           ${publicBaseUrl}`);
   console.log(`Softphone UI:          http://localhost:${PORT}/clickup-app/index.html`);
-  console.log(`Vobiz SIP User:        ${VOBIZ_SIP_USER}@${VOBIZ_REGISTRAR}`);
+  console.log(`Vobiz accounts:        any — agents sign in with their own Auth ID and Auth Token`);
   console.log(`ClickUp List ID:       ${CLICKUP_LIST_ID || "Not set"}`);
   console.log(`==================================================\n`);
 });

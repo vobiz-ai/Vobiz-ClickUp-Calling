@@ -37,7 +37,7 @@ sequenceDiagram
     
     Note over Agent,CU: --- 3. SECURE PLAYBACK FLOW ---
     Agent->>CU: Opens ClickUp Call Task & clicks Recording URL
-    CU->>BE: GET /recording-audio/<recordingId>?exp=&sig=
+    CU->>BE: GET /recording-audio/<recordingId>?a=<authId>&exp=&sig=
     BE->>VB: GET media.vobiz.ai (with Authorization Basic & X-Auth headers)
     VB-->>BE: Streams MP3 audio binary (HTTP 200 OK)
     BE-->>Agent: Audio plays directly in Agent Browser
@@ -47,15 +47,11 @@ sequenceDiagram
 
 ## 2. Environment & Credentials Configuration
 
-Ensure your `backend/.env` file contains your account credentials:
+`backend/.env` holds deployment settings only. No Vobiz credentials, numbers or
+SIP endpoints go in it: the agent signs in from the panel with their own Vobiz
+account, and the backend provisions their endpoint in that account.
 
 ```env
-# Vobiz Voice Platform Credentials
-VOBIZ_AUTH_ID=YOUR_VOBIZ_AUTH_ID
-VOBIZ_AUTH_TOKEN=YOUR_VOBIZ_AUTH_TOKEN
-VOBIZ_FROM_NUMBER=+15550100000
-VOBIZ_API_URL=https://api.vobiz.ai
-
 # Server Listening Port
 PORT=8092
 
@@ -80,12 +76,12 @@ CLICKUP_API_URL=https://api.clickup.com/api/v2
    npm run tunnel
    ```
 3. **Open Softphone Client**:
-   Navigate to: [http://localhost:8092/](http://localhost:8092/), sign in with the Auth ID and Auth Token, and wait for **Ready**.
+   Navigate to: [http://localhost:8092/](http://localhost:8092/), sign in on the **Vobiz account** tab with your Auth ID and Auth Token, pick a caller ID from the dropdown, and wait for **Ready**.
 4. **Place Outbound Call**:
    - Destination Number: your test phone, in E.164.
    - Click **Call**.
 5. **Answer Call & Converse**:
-   - Mobile phone rings from `VOBIZ_FROM_NUMBER`.
+   - Mobile phone rings from the caller ID you picked.
    - Answer and speak for **20–30 seconds**.
    - Click **End Call** on the Softphone (or hang up mobile phone).
 6. **Verify Task Creation in ClickUp**:
@@ -96,12 +92,10 @@ CLICKUP_API_URL=https://api.clickup.com/api/v2
 
 ### Test 2: Real PSTN Inbound Call Verification
 
-1. Ensure `npm run tunnel` is active and copy your public URL (e.g., `https://xxxx.trycloudflare.com`).
-2. In your Vobiz Portal (Voice Application settings for `+15550100000`):
-   - **Answer URL**: `https://xxxx.trycloudflare.com/answer` (`POST`)
-   - **Recording Callback**: `https://xxxx.trycloudflare.com/recording-callback` (`POST`)
-   - **Hangup / CDR Callback**: `https://xxxx.trycloudflare.com/hangup-callback` (`POST`)
-3. From any phone, dial **`+15550100000`**.
+1. Ensure `npm run tunnel` is active and you are signed in on the **Vobiz account** tab, reading **Ready**.
+2. Pick the number in the caller-ID dropdown and click **Enable inbound calls**. This attaches it to the
+   integration's application (answer URL `<tunnel>/answer`), moving it off any other application.
+3. From any phone, dial that number.
 4. Converse for 20–30 seconds and hang up.
 5. In ClickUp, a new Task named **`Vobiz Inbound Call - [Caller Number]`** appears with full call duration and audio link.
 
@@ -109,20 +103,12 @@ CLICKUP_API_URL=https://api.clickup.com/api/v2
 
 ### Test 3: Automated CLI Testing
 
-You can also run CLI test automation:
+```bash
+npm test
+```
 
-- **Simulated Outbound Call**:
-  ```bash
-  npm run test:outbound
-  ```
-- **Simulated Inbound Call**:
-  ```bash
-  npm run test:inbound
-  ```
-- **Live Vobiz CDR Fetch & Sync**:
-  ```bash
-  npm run fetch-cdr
-  ```
+Runs the whole suite against local stand-ins for Vobiz (two fake accounts) and ClickUp.
+To backfill live CDRs, use the **Sync CDRs** button in the panel while signed in.
 
 ---
 
@@ -139,7 +125,7 @@ Each ClickUp Task Description includes a structured CDR table:
 | :--- | :--- |
 | **Call UUID** | `12345678-abcd-ef01-2345-6789abcdef01` |
 | **Direction** | `Outbound` |
-| **From** | `+15550100000` |
+| **From** | `+15550100111` |
 | **To** | `+15550192834` |
 | **Agent** | `System Administrator` |
 | **Duration** | `00:45` (45s) |
@@ -149,7 +135,7 @@ Each ClickUp Task Description includes a structured CDR table:
 
 ---
 ### 🎧 Call Recording
-[▶ **Click to Play Call Recording**](https://xxxx.trycloudflare.com/recording-audio/<recordingId>?exp=1790000000&sig=<hmac>)
+[▶ **Click to Play Call Recording**](https://xxxx.trycloudflare.com/recording-audio/<recordingId>?a=<authId>&exp=1790000000&sig=<hmac>)
 ```
 
 ### ClickUp Status Column Mapping
