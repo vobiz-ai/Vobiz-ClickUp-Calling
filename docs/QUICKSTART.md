@@ -1,61 +1,59 @@
-﻿# Quick Start Guide: Vobiz ClickUp Integration
+# Quick start
 
-Get the Vobiz and ClickUp integration running and tested in simple steps!
+From a clone to a logged call. Node 18+ and `cloudflared` on your PATH.
 
----
-
-## Step 1: Start the Backend Server
-
-Open a terminal window in the project directory and run:
+## 1. Configure
 
 ```bash
-npm start
+cp backend/.env.example backend/.env
 ```
 
-*The server will start on `http://localhost:8092`.*
+Fill in `VOBIZ_AUTH_ID`, `VOBIZ_AUTH_TOKEN`, `VOBIZ_FROM_NUMBER` (a number on the
+account), `CLICKUP_API_TOKEN`, `CLICKUP_LIST_ID` and `SIGNING_SECRET`.
 
----
-
-## Step 2: Run Automated Mock Tests
-
-In a second terminal window, run the automated integration tests:
-
-### Outbound Call & Recording Test:
-```bash
-npm run test:outbound
-```
-
-### Inbound Call & Recording Test:
-```bash
-npm run test:inbound
-```
-
-### Recording Audio Proxy Test:
-```bash
-npm run test:recording
-```
-
----
-
-## Step 3: Open the Agent Softphone UI
-
-Open your browser and navigate to:
-[http://localhost:8092/agent-phone/index.html](http://localhost:8092/agent-phone/index.html)
-
-- Select your Agent profile (**System Administrator** or **John Doe**).
-- Enter a phone number and click **Call via Vobiz**.
-- Experience active call controls and click **Play MP3** to listen to the proxied call recording!
-
----
-
-## Step 4: Enable Live Webhooks (Optional for PSTN Calls)
-
-To receive live webhooks from Vobiz for real PSTN calls:
+## 2. Start the backend and a tunnel
 
 ```bash
-npm run tunnel
+npm start          # backend on :8092
+npm run tunnel     # second terminal; writes backend/tunnel-url.txt
 ```
 
-Copy the generated Quick Tunnel URL (`https://xxxx.trycloudflare.com`) and paste it as your callback URL in your Vobiz Voice Application settings.
+## 3. Provision Vobiz
 
-For full technical documentation, see [VOBIZ_CLICKUP_CDR_RECORDING_TESTING_GUIDE.md](VOBIZ_CLICKUP_CDR_RECORDING_TESTING_GUIDE.md).
+```bash
+npm run provision
+```
+
+This creates a Voice Application pointing at `<tunnel>/answer`, a SIP endpoint
+bound to it, attaches `VOBIZ_FROM_NUMBER` to the application for inbound, and
+writes `VOBIZ_SIP_USER` / `VOBIZ_SIP_PASSWORD` into `backend/.env`. Restart
+`npm start` afterwards so it picks them up.
+
+## 4. Check the answer URL
+
+```bash
+BASE=$(cat backend/tunnel-url.txt)
+curl -s "$BASE/health"
+curl -s "$BASE/answer?From=sip:x@registrar.vobiz.ai&To=%2B91XXXXXXXXXX&RouteType=sip"
+```
+
+The second must return XML containing `<Dial …><Number>`.
+
+## 5. Call
+
+Open [http://localhost:8092/](http://localhost:8092/), sign in with the Auth ID and
+Auth Token, allow the microphone, and wait for the badge to read **Ready** — that
+is the SIP registration. Dial a number in E.164. On hangup a task appears in the
+ClickUp list; the recording link is added to the same task when Vobiz reports it.
+
+For inbound, call `VOBIZ_FROM_NUMBER` from a phone while the softphone reads
+**Ready**, and accept the banner.
+
+## Tests
+
+```bash
+npm test
+```
+
+Starts its own backend against local stand-ins for the Vobiz and ClickUp APIs,
+so nothing is called, charged or written.

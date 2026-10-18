@@ -1,4 +1,7 @@
-﻿# Product Requirement Document (PRD)
+# Product Requirement Document (PRD)
+
+> **Design brief, not a feature list.** This is the original product brief. Mapping call outcomes to board statuses (`DIALING`, `CONNECTED`, `VOICEMAIL`, `NOT DIALED`) is not implemented: tasks take the list's default status, or `CLICKUP_TASK_STATUS` if set. See the [README](../README.md) for what ships.
+
 ## Vobiz SIP Trunking & Voice Platform — ClickUp CTI & Telephony Integration
 
 ---
