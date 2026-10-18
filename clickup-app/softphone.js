@@ -166,7 +166,10 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   function updateDialButtonState() {
-    const canDial = accountReady;
+    // Dialling needs the SIP registration, not just a signed-in session: the
+    // browser sends the INVITE itself, so before REGISTER lands there is no
+    // call to place.
+    const canDial = accountReady && sipRegistered;
     if (dialBtn) dialBtn.disabled = !canDial;
     if (testInboundBtn) testInboundBtn.disabled = !canDial;
     if (dialInput) dialInput.disabled = !accountReady;
@@ -327,6 +330,11 @@ document.addEventListener("DOMContentLoaded", () => {
 
     try {
       const res = await authFetch(`/api/clickup/search-task?phone=${encodeURIComponent(cleanPhone)}`);
+      if (res.status === 403) {
+        // SIP-direct sessions do not read ClickUp; the call is still logged.
+        if (cuTaskName) cuTaskName.textContent = "Task lookup needs the Vobiz account sign-in — the call is still logged";
+        return;
+      }
       const data = await res.json();
 
       if (data && data.found && data.task) {
@@ -399,8 +407,8 @@ document.addEventListener("DOMContentLoaded", () => {
       }));
 
       accountReady = true;
-      setStatus("Ready", "ok");
-      setLoginStatus(`Signed in as ${agentId} (${authId}) — Ready to call`);
+      setStatus("Registering…", "pending");
+      setLoginStatus(`Signed in as ${agentId} (${authId}) — registering the softphone…`);
       updateDialButtonState();
       if (authIdInput) authIdInput.value = "";
       if (authTokenInput) authTokenInput.value = "";
@@ -512,6 +520,12 @@ document.addEventListener("DOMContentLoaded", () => {
       });
       const sipJson = await sipRes.json().catch(() => ({}));
       if (sipJson && sipJson.token) sessionToken = sipJson.token;
+      if (!sipRes.ok) {
+        // Most often: the caller ID is not a number on the account. Calls would
+        // go out under the server default instead, so say so.
+        log(`Caller ID not accepted: ${sipJson.error || `HTTP ${sipRes.status}`}`, "error");
+        setLoginStatus(`Caller ID not accepted: ${sipJson.error || `HTTP ${sipRes.status}`}`);
+      }
     } catch (e) {
       console.warn("[Softphone] /login-sip notice:", e.message);
     }
@@ -585,9 +599,10 @@ document.addEventListener("DOMContentLoaded", () => {
   window.VobizSip.on("registrationFailed", (cause) => {
     sipRegistered = false;
     if (authMode === "account") {
-      setStatus("Ready", "ok");
-      setLoginStatus(`Signed in as ${agentSelect.value || "admin"} (${authIdInput.value.trim() || "Vobiz"}) — Ready to call`);
-      log(`Vobiz account ready. Operating in Vobiz calling mode (SIP note: ${cause}).`, "info");
+      // Not "Ready": without a registration there is nothing to call with.
+      setStatus("Not registered", "error");
+      setLoginStatus(`Signed in, but the softphone could not register: ${cause}. Check VOBIZ_SIP_USER and VOBIZ_SIP_PASSWORD on the server.`);
+      log(`SIP registration failed: ${cause}`, "error");
     } else {
       setStatus("Offline", "error");
       setLoginStatus(`SIP registration failed: ${cause}. Check your SIP username and password.`);
@@ -664,7 +679,7 @@ document.addEventListener("DOMContentLoaded", () => {
     if (dialBtn) dialBtn.hidden = false;
     if (hangupBtn) hangupBtn.hidden = true;
 
-    const isReady = sipRegistered || accountReady;
+    const isReady = sipRegistered;
     setStatus(isReady ? "Ready" : "Offline", isReady ? "ok" : "error");
 
     if (durationSec > 0 && currentCallDirection === "Inbound") {
@@ -703,46 +718,18 @@ document.addEventListener("DOMContentLoaded", () => {
   // ─── Outbound Calling & Keypad ────────────────────────────────────────────
   let activeApiCallUuid = null;
 
-  async function startApiCall({ number, callerId, direction }) {
-    try {
-      log(`Calling ${number} from ${callerId} via Vobiz Voice API…`, "info");
-      const res = await fetch(`${backendUrl}/api/calls/start`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {})
-        },
-        body: JSON.stringify({
-          to: number,
-          from: callerId,
-          direction,
-          agentId: agentSelect.value || "admin",
-          authId: authIdInput ? authIdInput.value.trim() : "",
-          authToken: authTokenInput ? authTokenInput.value.trim() : ""
-        })
-      });
-      const data = await res.json();
-      if (!data.ok) throw new Error(data.error || "Failed to start call");
-
-      activeApiCallUuid = data.callUuid;
-      setStatus("On call", "busy");
-      startCallTimer();
-      if (callStatusText) callStatusText.textContent = `${direction} call in progress with ${number}`;
-
-      if (data.vobizResponse && data.vobizResponse.message) {
-        log(`Vobiz carrier: ${data.vobizResponse.message} (UUID: ${activeApiCallUuid})`, "success");
-      } else {
-        log(`Call placed to carrier for ${number} (Session: ${activeApiCallUuid})`, "success");
-      }
-    } catch (err) {
-      log(`Call failed: ${err.message}`, "error");
-      handleCallEnded();
-    }
-  }
-
   async function hangupCurrentCall() {
     if (window.VobizSip.getSession()) {
       window.VobizSip.hangup();
+      return;
+    }
+
+    if (activeApiCallUuid && activeApiCallUuid.startsWith("inbound_")) {
+      // A "Test Inbound Call" preview: no call happened, so nothing is written
+      // to ClickUp.
+      activeApiCallUuid = null;
+      log("Inbound preview ended — preview calls are not logged to ClickUp.");
+      handleCallEnded(secondsElapsed);
       return;
     }
 
@@ -819,12 +806,15 @@ document.addEventListener("DOMContentLoaded", () => {
       ];
       const session = window.VobizSip.call(number, remoteAudio, extraHeaders);
       if (!session) {
-        log("WebRTC direct call could not start. Using Vobiz API calling engine…", "warn");
-        startApiCall({ number, callerId, direction: "Outbound" });
+        log("The call could not start. Check the microphone permission and that the status reads Ready.", "error");
+        handleCallEnded();
       }
     } else {
-      // Direct testing via Vobiz API / Auth ID & Auth Token
-      startApiCall({ number, callerId, direction: "Outbound" });
+      // The browser is the A leg: without a registered softphone there is no
+      // call to place. Ringing the customer over the REST API first and
+      // bridging the agent in afterwards leaves them listening to ringback.
+      log("Not registered yet — wait for the status to read Ready, then dial.", "error");
+      handleCallEnded();
     }
   }
 
@@ -1043,11 +1033,11 @@ document.addEventListener("DOMContentLoaded", () => {
         if (data.loggedIn) {
           sessionToken = savedSession.token;
           accountReady = true;
-          setStatus("Ready", "ok");
+          setStatus("Registering…", "pending");
           updateDialButtonState();
           if (authIdInput) authIdInput.value = "";
           if (authTokenInput) authTokenInput.value = "";
-          setLoginStatus(`Signed in as ${data.agentId} (${data.authId}) — Ready to call`);
+          setLoginStatus(`Signed in as ${data.agentId} (${data.authId}) — registering the softphone…`);
           if (logoutBtn) logoutBtn.classList.remove("hidden");
           if (data.numbers && data.numbers.length > 0) {
             populateNumberSelect(data.numbers, data.from);
