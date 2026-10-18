@@ -24,6 +24,18 @@ const BASE_URL = `http://127.0.0.1:${PORT}`;
 const TEST_AUTH_ID = process.env.VOBIZ_AUTH_ID || "test_auth_id";
 const TEST_AUTH_TOKEN = process.env.VOBIZ_AUTH_TOKEN || "test_auth_token";
 const TEST_FROM_NUMBER = process.env.VOBIZ_FROM_NUMBER || "+15550100000";
+const MOCK_URL = process.env.MOCK_URL || "";
+
+/** Requests the backend made to the stand-in Vobiz and ClickUp APIs. */
+async function upstream() {
+  if (!MOCK_URL) return [];
+  const res = await fetch(`${MOCK_URL}/__requests`);
+  return res.json();
+}
+
+function form(obj) {
+  return { "Content-Type": "application/x-www-form-urlencoded" };
+}
 
 let passed = 0;
 let failed = 0;
@@ -91,8 +103,18 @@ async function runTests() {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ agentId: "attacker", authId: "totally-fake", authToken: "totally-fake" })
   });
-  assert(badLogin.status === 401, "POST /login refuses credentials Vobiz did not accept");
+  assert(badLogin.status === 401, "POST /login refuses credentials that are not this server's account");
   assert(!(badLogin.json && badLogin.json.token), "a refused login issues no session token");
+
+  // Another account's credentials are valid at Vobiz — the stand-in API accepts
+  // anything, as a stranger's own account would — but this backend is bound to
+  // one account, and signing them in would hand over its SIP password.
+  const strangerLogin = await request("/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ agentId: "admin", authId: "MA_STRANGER", authToken: "a-valid-token-for-another-account" })
+  });
+  assert(strangerLogin.status === 401 && !(strangerLogin.json && strangerLogin.json.token), "POST /login refuses a different Vobiz account, even with valid credentials");
 
   // Mode 1: Account Login, with the credentials this server is bound to.
   const loginRes = await request("/login", {
@@ -137,6 +159,26 @@ async function runTests() {
   });
   assert(spoof.status === 400, "POST /login-sip refuses a caller ID the account does not own");
 
+  // /login-sip proves only knowledge of a DID, which is public. Its session
+  // must not reach account data or anything that spends money.
+  const sipAuth = { Authorization: `Bearer ${sipLoginRes.json.token}` };
+  const sipRecordings = await request("/recordings", { headers: sipAuth });
+  assert(sipRecordings.status === 403, "a SIP-direct session cannot list the account's recordings");
+  const sipSearch = await request("/api/clickup/search-task?phone=15550188888", { headers: sipAuth });
+  assert(sipSearch.status === 403, "a SIP-direct session cannot search ClickUp tasks");
+  const sipCdrs = await request("/sync-recent-cdrs", { headers: sipAuth });
+  assert(sipCdrs.status === 403, "a SIP-direct session cannot sync CDRs");
+  const sipCall = await request("/api/calls/start", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...sipAuth },
+    body: JSON.stringify({ to: "+15550199999" })
+  });
+  assert(sipCall.status === 403, "a SIP-direct session cannot use the call API");
+  const sipAgentSip = await request("/api/agent-sip", { headers: sipAuth });
+  assert(sipAgentSip.status === 403 && !sipAgentSip.text.includes("sipPassword"), "a SIP-direct session is never served the account SIP password");
+  const sipAudio = await request("/recording-audio/rec_123", { headers: sipAuth });
+  assert(sipAudio.status === 403, "a SIP-direct session cannot stream recordings without a signature");
+
   // SIP Credentials for Softphone UA — behind the session. An unauthenticated
   // caller is never shown a SIP password, whatever agent id they name.
   const agentSipAnon = await request("/agent/anyone");
@@ -145,6 +187,7 @@ async function runTests() {
 
   const agentSip = await request("/api/agent-sip", { headers: auth });
   assert(agentSip.status === 200 && agentSip.json.sipUser, "GET /api/agent-sip returns SIP endpoint credentials");
+  assert(agentSip.json.sipUser.startsWith("test_sip_user@"), "the configured SIP user is served, not a discovered endpoint paired with the configured password");
   assert(agentSip.json.registrarUrl.startsWith("wss://"), "Registrar URL uses secure WebSocket wss://");
 
   // 3. Number Selection
@@ -162,9 +205,16 @@ async function runTests() {
       "Content-Type": "application/json",
       Authorization: `Bearer ${sessionToken}`
     },
+    body: JSON.stringify({ number: TEST_FROM_NUMBER, agentId: "admin" })
+  });
+  assert(selectNumRes.status === 200 && selectNumRes.json.selected === TEST_FROM_NUMBER, "POST /select-number updates selected caller ID");
+
+  const selectSpoof = await request("/select-number", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${sessionToken}` },
     body: JSON.stringify({ number: "+15550123456", agentId: "admin" })
   });
-  assert(selectNumRes.status === 200 && selectNumRes.json.selected === "+15550123456", "POST /select-number updates selected caller ID");
+  assert(selectSpoof.status === 400, "POST /select-number refuses a caller ID the account does not own");
 
   // 4. Outbound Calling: Browser-as-A-leg Answer XML
   console.log("\n[4/8] Testing Outbound Call Flow (Browser-as-A-leg)...");
@@ -174,28 +224,63 @@ async function runTests() {
   assert(outboundAnswer.text.includes("<Dial"), "/answer XML contains <Dial>");
   assert(outboundAnswer.text.includes("<Number>+15550199999</Number>") || outboundAnswer.text.includes("<Number>15550199999</Number>"), "/answer XML dials destination <Number>");
   assert(outboundAnswer.text.includes("<Record"), "/answer XML contains self-closing <Record> for call recording");
+  assert(/<Record[^>]*\/>\s*<Dial/.test(outboundAnswer.text), "<Record> is a self-closing sibling before <Dial>, not nested");
+  assert(/<Dial[^>]*action="[^"]+\/dial-status"[^>]*redirect="false"/.test(outboundAnswer.text), "<Dial> carries action and redirect=\"false\"");
+
+  // Vobiz posts webhooks form-encoded. The browser's caller-ID header is a
+  // request: a number the account does not own must not become the caller ID.
+  const outboundForm = await request("/answer", {
+    method: "POST",
+    headers: form(),
+    body: new URLSearchParams({
+      From: "sip:test_sip_user@registrar.vobiz.ai",
+      To: "+15550177777",
+      CallUUID: "outbound_uuid_form",
+      "X-VH-Caller-ID": "+19998887777",
+    }).toString()
+  });
+  assert(outboundForm.text.includes("<Number>+15550177777</Number>"), "form-encoded /answer from the softphone dials <Number>");
+  assert(outboundForm.text.includes(`callerId="${TEST_FROM_NUMBER}"`), "a caller ID the account does not own is replaced with an owned one");
+  assert(!outboundForm.text.includes("<User>"), "an outbound call from the browser never bridges with <Dial><User>");
 
   // 5. Inbound Calling: PSTN DID to SIP Agent Bridging XML
   console.log("\n[5/8] Testing Inbound Call Flow (PSTN to SIP Agent)...");
   const inboundAnswer = await request("/answer?From=%2B15550188888&To=%2B15550100000&CallUUID=inbound_uuid_202");
   assert(inboundAnswer.status === 200, "GET /answer (Inbound) returns HTTP 200");
   assert(inboundAnswer.text.includes("<User>sip:"), "/answer XML bridges incoming call to agent <User>sip:...");
-  assert(outboundAnswer.text.includes("<Record"), "Inbound XML contains <Record> tag");
+  assert(inboundAnswer.text.includes("<Record"), "Inbound XML contains <Record> tag");
+
+  const inboundForm = await request("/answer", {
+    method: "POST",
+    headers: form(),
+    body: new URLSearchParams({ From: "919812345678", To: "15550100000", CallUUID: "inbound_uuid_form" }).toString()
+  });
+  assert(inboundForm.text.includes(`callerId="+15550100000"`), "inbound <Dial> callerId is the dialled DID, in E.164");
+  assert(inboundForm.text.includes("<User>sip:test_sip_user@"), "inbound rings the configured SIP endpoint");
+  assert(!inboundForm.text.includes("Polly."), "inbound XML uses no voice outside the documented <Speak> set");
 
   // 6. CDR Logging & ClickUp Task Creation
   console.log("\n[6/8] Testing CDR Logging & ClickUp Task Generation...");
   const dialStatus = await request("/dial-status", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
+    headers: form(),
+    body: new URLSearchParams({
       CallUUID: "outbound_uuid_101",
       DialStatus: "completed",
       DialHangupCause: "NORMAL_CLEARING",
       DialBLegUUID: "bleg_uuid_555",
-      DialBLegDuration: 52
-    })
+      DialBLegDuration: "52"
+    }).toString()
   });
-  assert(dialStatus.status === 200, "POST /dial-status logs CDR successfully");
+  assert(dialStatus.status === 200, "POST /dial-status (form-encoded) is acknowledged");
+
+  const afterDial = (await upstream()).filter((r) => r.url.startsWith("/clickup/"));
+  const created = afterDial.find((r) => r.method === "POST" && r.url === "/clickup/list/list_1/task");
+  assert(Boolean(created), "the dial result creates a ClickUp task in CLICKUP_LIST_ID");
+  const createdBody = created ? JSON.parse(created.body) : {};
+  assert(createdBody.name === "Vobiz Outbound Call - +15550199999", "task title is direction and customer number");
+  assert(String(createdBody.description || "").includes("`52s`") || String(createdBody.description || "").includes("(52s)"), "task carries the B-leg duration from the form-encoded webhook");
+  assert(!("status" in createdBody), "no hardcoded status is sent — ClickUp rejects one the list does not define");
 
   // Simulated call endpoint
   const simCall = await request("/test-simulated-call", {
@@ -216,15 +301,29 @@ async function runTests() {
   console.log("\n[7/8] Testing Call Recording Webhooks & Playback Proxy...");
   const recCallback = await request("/recording-ready", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
+    headers: form(),
+    body: new URLSearchParams({
       CallUUID: "outbound_uuid_101",
       RecordingID: "rec_998877",
       RecordUrl: "https://media.vobiz.ai/v1/Account/demo/Recording/sample.mp3",
-      RecordingDuration: 52
-    })
+      RecordingDuration: "52"
+    }).toString()
   });
   assert(recCallback.status === 200, "POST /recording-ready captures recording callback");
+  assert(!recCallback.text.includes("sig="), "the unauthenticated recording webhook does not echo a signed playback link");
+
+  const clickupCalls = (await upstream()).filter((r) => r.url.startsWith("/clickup/") && r.body.includes("outbound_uuid_101"));
+  assert(clickupCalls.filter((r) => r.method === "POST").length === 1, "one call produces one ClickUp task, not one per webhook");
+  const update = clickupCalls.find((r) => r.method === "PUT");
+  assert(Boolean(update) && update.body.includes("/recording-audio/rec_998877?exp="), "the recording updates the same task with a signed playback link");
+
+  const strayRec = await request("/recording-ready", {
+    method: "POST",
+    headers: form(),
+    body: new URLSearchParams({ CallUUID: "never_answered_here", RecordingID: "rec_x", To: "[x](https://evil.example)" }).toString()
+  });
+  const strayTask = (await upstream()).some((r) => r.url.startsWith("/clickup/") && r.body.includes("never_answered_here"));
+  assert(strayRec.status === 200 && !strayTask, "a recording webhook for a call this server never answered creates no task");
 
   // Recordings list
   const recListAnon = await request("/recordings");
@@ -234,7 +333,7 @@ async function runTests() {
   assert(recList.status === 200 && Array.isArray(recList.json.recordings), "GET /recordings returns recording list");
   assert(recList.json.recordings.length > 0, "Recordings array contains recent recording");
   const firstRec = recList.json.recordings[0];
-  assert(firstRec.playUrl && (firstRec.playUrl.includes("sig=") || firstRec.playUrl.includes("recording-file")), "Recording includes signed or proxied playUrl");
+  assert(firstRec.playUrl && firstRec.playUrl.includes("sig="), "Recording includes a signed playUrl");
 
   // 8. Zendesk-Aligned UI, Inbound Call Popup & Static File Serving
   console.log("\n[8/8] Testing Zendesk UI Assets & Inbound Popup Modal markup...");
@@ -312,6 +411,23 @@ async function runTests() {
     body: JSON.stringify({ to: "+15550199999", authId: "attacker", authToken: "attacker" })
   });
   assert(callAnon.status === 401, "POST /api/calls/start must refuse an unauthenticated caller");
+
+  // The REST originate + <Dial><User> design rings the customer into ringback.
+  // The softphone is the A leg, so the backend never originates a call.
+  const callSigned = await request("/api/calls/start", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...auth },
+    body: JSON.stringify({ to: "+15550199999" })
+  });
+  assert(callSigned.status === 409, "POST /api/calls/start does not originate a call, even signed in");
+  const originated = (await upstream()).some((r) => r.method === "POST" && /\/Call\/?$/.test(r.url.split("?")[0]));
+  assert(!originated, "the backend never POSTed to the Vobiz Call API during the whole suite");
+
+  const softphoneSrc = fs.readFileSync(path.join(__dirname, "..", "clickup-app", "softphone.js"), "utf8");
+  assert(!softphoneSrc.includes("/api/calls/start"), "the softphone has no REST-originate fallback");
+  const sipSrc = fs.readFileSync(path.join(__dirname, "..", "clickup-app", "vobiz-sip.js"), "utf8");
+  const ua = (sipSrc.match(/user_agent:\s*"([^"]+)"/) || [])[1] || "";
+  assert(ua && !/\s/.test(ua), "the JsSIP user_agent is set and has no space (a space makes Vobiz block <Dial><User>)");
 
   const cdrAnon = await request("/sync-recent-cdrs");
   assert(cdrAnon.status === 401, "GET /sync-recent-cdrs must refuse an unauthenticated caller");
