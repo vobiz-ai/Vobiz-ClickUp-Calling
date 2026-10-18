@@ -1,4 +1,6 @@
-﻿# Vobiz to ClickUp Integration: Inbound, Outbound, CDR & Recording Testing Guide
+# Vobiz to ClickUp Integration: Inbound, Outbound, CDR & Recording Testing Guide
+
+> **Note on statuses.** The status columns described below are not implemented. Tasks take the list's default status, or `CLICKUP_TASK_STATUS` if you set one that the list defines.
 
 This document provides complete technical documentation and step-by-step instructions for testing **Inbound Calls**, **Outbound Calls**, **Call Detail Records (CDRs)**, and **Call Recordings** between Vobiz SIP/Voice Platform and ClickUp Workspace.
 
@@ -59,7 +61,6 @@ PORT=8092
 
 # ClickUp API Credentials & Workspace Location
 CLICKUP_API_TOKEN=pk_YOUR_CLICKUP_PERSONAL_API_TOKEN
-CLICKUP_TEAM_ID=YOUR_CLICKUP_TEAM_ID
 CLICKUP_LIST_ID=YOUR_CLICKUP_LIST_ID
 CLICKUP_API_URL=https://api.clickup.com/api/v2
 ```
@@ -79,18 +80,17 @@ CLICKUP_API_URL=https://api.clickup.com/api/v2
    npm run tunnel
    ```
 3. **Open Softphone Client**:
-   Navigate to: [http://localhost:8092/agent-phone/index.html](http://localhost:8092/agent-phone/index.html)
+   Navigate to: [http://localhost:8092/](http://localhost:8092/), sign in with the Auth ID and Auth Token, and wait for **Ready**.
 4. **Place Outbound Call**:
-   - Select Agent: **System Administrator**.
-   - Destination Number: `+15550192834` (or your test phone).
-   - Click **Call via Vobiz**.
+   - Destination Number: your test phone, in E.164.
+   - Click **Call**.
 5. **Answer Call & Converse**:
-   - Mobile phone rings from `+15550100000`.
+   - Mobile phone rings from `VOBIZ_FROM_NUMBER`.
    - Answer and speak for **20–30 seconds**.
    - Click **End Call** on the Softphone (or hang up mobile phone).
 6. **Verify Task Creation in ClickUp**:
    - Open your ClickUp **`Telephony`** List.
-   - Refresh the page $\rightarrow$ A new Task named **`Vobiz Outbound Call - +15550192834`** will land directly in the green 🟢 **`CONNECTED`** column!
+   - Refresh the page $\rightarrow$ a new task named **`Vobiz Outbound Call - <your number>`** appears, with the list's default status (or `CLICKUP_TASK_STATUS` if set).
 
 ---
 
@@ -98,7 +98,7 @@ CLICKUP_API_URL=https://api.clickup.com/api/v2
 
 1. Ensure `npm run tunnel` is active and copy your public URL (e.g., `https://xxxx.trycloudflare.com`).
 2. In your Vobiz Portal (Voice Application settings for `+15550100000`):
-   - **Answer URL**: `https://xxxx.trycloudflare.com/answer?agentId=admin` (`POST`)
+   - **Answer URL**: `https://xxxx.trycloudflare.com/answer` (`POST`)
    - **Recording Callback**: `https://xxxx.trycloudflare.com/recording-callback` (`POST`)
    - **Hangup / CDR Callback**: `https://xxxx.trycloudflare.com/hangup-callback` (`POST`)
 3. From any phone, dial **`+15550100000`**.

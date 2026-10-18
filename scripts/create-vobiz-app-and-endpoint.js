@@ -132,7 +132,10 @@ async function main() {
     username: endpointPrefix,
     password: endpointPassword,
     alias: endpointAlias,
-    ...(appId ? { app_id: appId } : {}),
+    // The Create Endpoint API takes the numeric app id as `application`. Sent
+    // as `app_id` it is ignored, the endpoint is left with no application, and
+    // the softphone's outbound INVITE never reaches /answer.
+    ...(appId ? { application: Number(appId) } : {}),
   };
 
   let finalSipUsername = "";
@@ -171,13 +174,23 @@ async function main() {
       const numJson = await numRes.json();
       const numbers = (numJson.objects || numJson.items || []).map((n) => n.e164 || n.number).filter(Boolean);
       if (numbers.length > 0) {
-        attachedNumber = numbers[0];
-        console.log(`Found ${numbers.length} account number(s). Primary number: ${attachedNumber}`);
+        // Attach only the number this install calls from. Taking the first
+        // number on the account would silently re-point a DID that another
+        // application may be answering.
+        const wanted = (envVars.VOBIZ_FROM_NUMBER || "").trim();
+        const norm = (n) => "+" + String(n).replace(/\D/g, "");
+        attachedNumber = numbers.find((n) => wanted && norm(n) === norm(wanted)) || "";
+        console.log(`Found ${numbers.length} account number(s).`);
 
-        if (appId) {
+        if (!attachedNumber) {
+          console.log(
+            `ℹ️ VOBIZ_FROM_NUMBER (${wanted || "unset"}) is not on this account, so no number was attached. ` +
+              "Set it in backend/.env to a number you own and re-run, or attach it in the Vobiz Console."
+          );
+        } else if (appId) {
           console.log(`Linking number ${attachedNumber} to Application ${appId}...`);
-          const encodedNum = encodeURIComponent(attachedNumber);
-          const linkRes = await fetch(`${API_URL}/api/v1/Account/${AUTH_ID}/Number/${encodedNum}/application/`, {
+          const encodedNum = encodeURIComponent(norm(attachedNumber));
+          const linkRes = await fetch(`${API_URL}/api/v1/Account/${AUTH_ID}/numbers/${encodedNum}/application`, {
             method: "POST",
             headers: authHeaders,
             body: JSON.stringify({ app_id: appId }),
@@ -185,7 +198,8 @@ async function main() {
           if (linkRes.ok) {
             console.log(`✅ Number ${attachedNumber} linked to Application!`);
           } else {
-            console.log(`ℹ️ Number attachment returned HTTP ${linkRes.status} (May be linked via Vobiz Console).`);
+            console.log(`⚠️ Number attachment returned HTTP ${linkRes.status}: ${await linkRes.text()}`);
+            console.log("   Attach it in the Vobiz Console, or inbound calls will not reach this backend.");
           }
         }
       } else {
@@ -207,7 +221,7 @@ async function main() {
       VOBIZ_SIP_USER: finalSipUsername,
       VOBIZ_SIP_PASSWORD: endpointPassword,
       VOBIZ_REGISTRAR: "registrar.vobiz.ai",
-      VOBIZ_FROM_NUMBER: attachedNumber || "+15550100000",
+      ...(attachedNumber ? { VOBIZ_FROM_NUMBER: attachedNumber } : {}),
       ...(appId ? { VOBIZ_APP_ID: appId } : {}),
       ...(cleanTunnel && !cleanTunnel.includes("your-tunnel") ? { TUNNEL_URL: cleanTunnel } : {}),
     };
@@ -232,7 +246,7 @@ async function main() {
   console.log(`SIP Username:    ${finalSipUsername || endpointPrefix}`);
   console.log(`SIP Password:    ${endpointPassword}`);
   console.log(`Registrar:       wss://registrar.vobiz.ai:5063/`);
-  console.log(`Caller DID:      ${attachedNumber || "+15550100000"}`);
+  console.log(`Caller DID:      ${attachedNumber || "not attached — see above"}`);
   console.log(`Answer URL:      ${cleanTunnel}/answer`);
   console.log(`Hangup URL:      ${cleanTunnel}/hangup-callback`);
   console.log("========================================================\n");

@@ -40,9 +40,11 @@ endpoint, and it works.
 | `scripts/create-vobiz-app-and-endpoint.js` | Provisions the Vobiz application and SIP endpoint |
 | `scripts/fetch-cdr.js` | Pulls recent CDRs and syncs them to ClickUp from the command line |
 
-ClickUp is written through its REST API with a personal token. The softphone is
-a page served by the backend that you open beside ClickUp, rather than an
-extension inside it — so there is nothing to install into your workspace.
+The softphone is a web page served by this backend, opened in a tab beside
+ClickUp. It is not a ClickUp app: nothing appears inside ClickUp, and there is
+no OAuth. Tasks are written through ClickUp's REST API with one personal API
+token, so every task is created as that token's owner, whichever agent made the
+call.
 
 ---
 

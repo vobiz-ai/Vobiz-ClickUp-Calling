@@ -62,7 +62,7 @@ told the agent could not be reached.
 3. Describe what you verified and how — "ran the suite" and "placed a live call
    to +91…, two-way audio, `DialBLegUUID` present" are different claims, and the
    second is the one that matters for anything touching call flow.
-4. Update `CHANGELOG.md` for anything user-visible, and `ISSUES.md` if you close
+4. Update `CHANGELOG.md` for anything user-visible, and the docs if you close
    or discover a limitation.
 
 ## Reporting a vulnerability

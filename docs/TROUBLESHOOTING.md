@@ -87,7 +87,7 @@ what selects that branch.
 
 The inbound bridge targets `VOBIZ_SIP_USER`, or else the first live session
 carrying a SIP username. With more than one agent signed in, which one rings is
-arbitrary. There is no routing or presence — see [ISSUES.md](../ISSUES.md).
+arbitrary. There is no routing or presence.
 
 ---
 
@@ -97,12 +97,14 @@ arbitrary. There is no routing or presence — see [ISSUES.md](../ISSUES.md).
    their `YOUR_…` placeholders. Unconfigured, the backend logs the task and
    returns `simulated: true` — deliberately, rather than pretending.
 2. A ClickUp API error is logged with its status and body:
-   `[ClickUp] API error (400): …`. The usual cause is a **status the list does
-   not define** — tasks are created as `CONNECTED`.
+   `[ClickUp] API error (400): …`. If you set `CLICKUP_TASK_STATUS`, it must be
+   a status the list defines; leave it unset to use the list's default.
 3. The token owner needs access to that list. A personal token carries their
    access, not yours.
-4. The task is created at hangup (`/api/calls/end`) or when the recording
-   callback arrives. A call that never connected produces neither.
+4. The task is created when Vobiz posts the `<Dial>` result to `/dial-status`,
+   and the recording link is added to the same task when `/recording-ready`
+   fires. Both need the tunnel up; a call the backend never answered produces
+   neither.
 
 ---
 
