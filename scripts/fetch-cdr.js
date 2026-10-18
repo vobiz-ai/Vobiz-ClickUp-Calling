@@ -99,8 +99,22 @@ async function main() {
     console.log(`🔄 Triggering ClickUp CDR & Recording Synchronization`);
     console.log(`==================================================`);
     try {
-      const res = await fetch(`http://localhost:${PORT}/sync-recent-cdrs`);
+      // /sync-recent-cdrs sits behind a session, so sign in with the account
+      // this backend is bound to first.
+      const login = await fetch(`http://localhost:${PORT}/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ authId: VOBIZ_AUTH_ID, authToken: VOBIZ_AUTH_TOKEN }),
+      });
+      const loginJson = await login.json().catch(() => ({}));
+      if (!login.ok || !loginJson.token) {
+        throw new Error(`sign-in to the backend failed: HTTP ${login.status} ${loginJson.error || ""}`);
+      }
+      const res = await fetch(`http://localhost:${PORT}/sync-recent-cdrs`, {
+        headers: { Authorization: `Bearer ${loginJson.token}` },
+      });
       const syncJson = await res.json();
+      if (!res.ok) process.exitCode = 1;
       console.log(JSON.stringify(syncJson, null, 2));
     } catch (err) {
       console.error("❌ Sync trigger failed (Is 'npm start' / 'node backend/server.js' running?):", err.message);
