@@ -2,8 +2,11 @@
  *
  * THE BROWSER IS THE A LEG.
  * Supports dual connect:
- * 1. connect({ token, audioElement, backendUrl }) - Account mode
- * 2. connectDirect({ sipUser, sipPassword, displayName, registrarUrl, audioElement }) - SIP direct mode
+ * 1. connect({ token, audioElement, backendUrl }) - Vobiz account mode: the
+ *    backend provisioned this agent's endpoint in the signed-in account and
+ *    minted a SIP password for this session.
+ * 2. connectDirect({ sipUser, sipPassword, displayName, registrarUrl, audioElement }) - SIP direct mode:
+ *    an existing endpoint's credentials, typed by the agent, never sent to the backend.
  *
  * Exposes window.VobizSip.
  */

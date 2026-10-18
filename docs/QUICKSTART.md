@@ -8,8 +8,9 @@ From a clone to a logged call. Node 18+ and `cloudflared` on your PATH.
 cp backend/.env.example backend/.env
 ```
 
-Fill in `VOBIZ_AUTH_ID`, `VOBIZ_AUTH_TOKEN`, `VOBIZ_FROM_NUMBER` (a number on the
-account), `CLICKUP_API_TOKEN`, `CLICKUP_LIST_ID` and `SIGNING_SECRET`.
+Fill in `CLICKUP_API_TOKEN`, `CLICKUP_LIST_ID` and `SIGNING_SECRET`. That is all:
+no Vobiz credentials, numbers or SIP endpoints go in `.env`. Agents sign in from
+the panel with their own Vobiz account.
 
 ## 2. Start the backend and a tunnel
 
@@ -18,36 +19,42 @@ npm start          # backend on :8092
 npm run tunnel     # second terminal; writes backend/tunnel-url.txt
 ```
 
-## 3. Provision Vobiz
-
-```bash
-npm run provision
-```
-
-This creates a Voice Application pointing at `<tunnel>/answer`, a SIP endpoint
-bound to it, attaches `VOBIZ_FROM_NUMBER` to the application for inbound, and
-writes `VOBIZ_SIP_USER` / `VOBIZ_SIP_PASSWORD` into `backend/.env`. Restart
-`npm start` afterwards so it picks them up.
-
-## 4. Check the answer URL
+## 3. Check the answer URL
 
 ```bash
 BASE=$(cat backend/tunnel-url.txt)
 curl -s "$BASE/health"
-curl -s "$BASE/answer?From=sip:x@registrar.vobiz.ai&To=%2B91XXXXXXXXXX&RouteType=sip"
+curl -s "$BASE/answer?From=%2B15550100111&To=%2B15550100222"
 ```
 
-The second must return XML containing `<Dial …><Number>`.
+The second must return `<Response>` XML (with nobody signed in, a polite
+`<Speak>` and `<Hangup/>`). An HTML page means the tunnel is not reaching the
+backend.
+
+## 4. Sign in
+
+Open [http://localhost:8092/](http://localhost:8092/).
+
+- **Vobiz account** tab: type your Auth ID and Auth Token. The backend checks
+  them with Vobiz, creates this integration's application in your account
+  (answer URL `<tunnel>/answer`) if it is not there yet, creates or reuses your
+  SIP endpoint, binds it to the application and sets a fresh SIP password for
+  this sign-in. Your numbers fill the caller-ID dropdown.
+- **SIP Direct** tab: type an existing endpoint's SIP username and password and a
+  caller ID. The endpoint and number must already be attached to an application
+  whose answer URL is `<tunnel>/answer` — see the README for the console steps.
+
+Allow the microphone and wait for the badge to read **Ready**.
 
 ## 5. Call
 
-Open [http://localhost:8092/](http://localhost:8092/), sign in with the Auth ID and
-Auth Token, allow the microphone, and wait for the badge to read **Ready** — that
-is the SIP registration. Dial a number in E.164. On hangup a task appears in the
-ClickUp list; the recording link is added to the same task when Vobiz reports it.
+Dial a number in E.164. On hangup a task appears in the ClickUp list; the
+recording link is added to the same task when Vobiz reports it.
 
-For inbound, call `VOBIZ_FROM_NUMBER` from a phone while the softphone reads
-**Ready**, and accept the banner.
+For inbound (account mode), pick the number in the dropdown and click **Enable
+inbound calls** once. That attaches the number to the integration's application,
+moving it off any other application. Then call it from a phone while the
+softphone reads **Ready**, and accept the banner.
 
 ## Tests
 
@@ -56,4 +63,4 @@ npm test
 ```
 
 Starts its own backend against local stand-ins for the Vobiz and ClickUp APIs,
-so nothing is called, charged or written.
+with two fake accounts, so nothing is called, charged or written.

@@ -38,7 +38,7 @@ By connecting Vobiz's high-concurrency SIP trunking and Voice APIs directly with
 | :--- | :--- | :--- |
 | **Sales Development Rep (SDR)** | Conduct high-volume outbound calling to leads and automatically track conversation duration and status. | Outbound Softphone Dialer, Auto-CDR Task Creation, Board Column Status Updates (`CONNECTED`). |
 | **Customer Support Agent** | Receive incoming support calls on Vobiz DIDs, bridge to softphone, and access past customer call logs. | Inbound Call Webhook Callback, SIP Softphone Bridging, ClickUp Task Search by Caller ID. |
-| **Support Manager / Team Lead** | Audit call quality, review agent call volume, and verify call recordings for compliance. | ClickUp Board View, Embedded Playable Audio Recording Links, Batch CDR Fetching (`fetch-cdr.js`). |
+| **Support Manager / Team Lead** | Audit call quality, review agent call volume, and verify call recordings for compliance. | ClickUp Board View, Embedded Playable Audio Recording Links, CDR sync from the panel. |
 
 ---
 
@@ -50,7 +50,7 @@ By connecting Vobiz's high-concurrency SIP trunking and Voice APIs directly with
 * **Status Updates**: Automatically update active call timer and status (`Calling...` $\rightarrow$ `Connected` $\rightarrow$ `Ended`).
 
 ### 3.2 Feature 2: Inbound PSTN Call Management
-* **DID Ingestion**: Receive incoming calls on Vobiz DID numbers (e.g., `+15550100000`).
+* **DID Ingestion**: Receive incoming calls on Vobiz DID numbers (e.g., `+15550100111`).
 * **XML Callback Serving**: Serve Vobiz XML call control instructions (`<Response><Speak>...</Speak><Record.../><Dial><User>sip:agent@sip.vobiz.ai</User></Dial></Response>`) via public HTTPS webhook endpoints (`/answer`).
 * **Caller Recognition**: Parse incoming caller ID (`From` number) and link call records to existing ClickUp tasks or create new customer call entries.
 
@@ -62,7 +62,7 @@ By connecting Vobiz's high-concurrency SIP trunking and Voice APIs directly with
 
 ### 3.4 Feature 4: Secure Call Recording Playback Proxy
 * **Callback Capture**: Catch Vobiz recording webhooks (`/recording-callback`) containing `RecordUrl`, `RecordingDuration`, and `CallUUID`.
-* **Audio Streaming Proxy**: Route recording playback through the signed `GET /recording-audio/<recordingId>?exp=&sig=`. The caller names a recording id, never a URL — the media URL is resolved server-side and checked against a host allowlist.
+* **Audio Streaming Proxy**: Route recording playback through the signed `GET /recording-audio/<recordingId>?a=<authId>&exp=&sig=`. The caller names a recording id, never a URL — the media URL is resolved server-side and checked against a host allowlist.
 * **Authentication & Redirect Handling**: Attach `Authorization: Basic` and `X-Auth` headers when requesting audio binaries from `media.vobiz.ai`, and safely strip headers on S3 redirects to ensure HTTP 200 streaming.
 * **ClickUp Playable Link**: Format playable Markdown link `[▶ Click to Play Call Recording](${proxiedUrl})` in ClickUp task descriptions.
 
@@ -104,7 +104,7 @@ sequenceDiagram
     
     Note over Agent,CU: --- 3. SECURE PLAYBACK FLOW ---
     Agent->>CU: Opens ClickUp Call Task & clicks Recording URL
-    CU->>BE: GET /recording-audio/<recordingId>?exp=&sig=
+    CU->>BE: GET /recording-audio/<recordingId>?a=<authId>&exp=&sig=
     BE->>VB: GET media.vobiz.ai (with Authorization Basic & X-Auth headers)
     VB-->>BE: Streams MP3 audio binary (HTTP 200 OK)
     BE-->>Agent: Audio plays directly in Agent Browser
@@ -123,7 +123,7 @@ sequenceDiagram
 | :--- | :--- |
 | **Call UUID** | `12345678-abcd-ef01-2345-6789abcdef01` |
 | **Direction** | `Outbound` |
-| **From** | `+15550100000` |
+| **From** | `+15550100111` |
 | **To** | `+15550192834` |
 | **Agent** | `System Administrator` |
 | **Duration** | `00:45` (45s) |
@@ -133,7 +133,7 @@ sequenceDiagram
 
 ---
 ### 🎧 Call Recording
-[▶ **Click to Play Call Recording**](https://xxxx.trycloudflare.com/recording-audio/<recordingId>?exp=1790000000&sig=<hmac>)
+[▶ **Click to Play Call Recording**](https://xxxx.trycloudflare.com/recording-audio/<recordingId>?a=<authId>&exp=1790000000&sig=<hmac>)
 ```
 
 ### 5.2 Board View Column Mapping
@@ -167,7 +167,7 @@ sequenceDiagram
 
 ## 7. Security, Compliance & Data Isolation
 
-1. **Credential Isolation**: All API tokens (`CLICKUP_API_TOKEN`), credentials (`VOBIZ_AUTH_TOKEN`), and workspace IDs are managed strictly via environment variables (`.env`).
+1. **Credential Isolation**: The ClickUp token and list ID live in `.env`. No Vobiz credentials do: any Vobiz account signs in from the panel, and its Auth Token is held in the backend's memory only, keyed by Auth ID — never on disk, in logs or in responses. Each session reaches only its own account's numbers, recordings and CDRs, and playback links carry the account inside their signature.
 2. **Repository Sanitization**: `.env`, `tunnel-url.txt`, `node_modules/`, and log files are strictly excluded via `.gitignore`.
 3. **Public URL Expiry**: Cloudflare Quick Tunnels generate transient, encrypted HTTPS endpoints without exposing local ports to raw public IP space.
 4. **Header Sanitization on Redirects**: The recording proxy automatically strips custom Vobiz authorization headers when following 302 redirects to Amazon S3 storage to avoid S3 signature rejection.
@@ -177,10 +177,7 @@ sequenceDiagram
 ## 8. Automated & Manual Testing Plan
 
 ### 8.1 Automated Test Suite Commands
-* `npm run test:outbound`: Validates outbound call payload formatting, recording URL generation, and ClickUp task creation under `CONNECTED` status.
-* `npm run test:inbound`: Validates inbound call payload processing and task creation.
-* `npm run test:recording`: Verifies that `/recording-file?url=` is gone (HTTP 410) and that unsigned `/recording-audio` playback is refused (HTTP 403).
-* `npm run fetch-cdr`: Pulls recent live CDRs from `api.vobiz.ai` and syncs them to ClickUp.
+* `npm test`: Starts the backend against local stand-ins for Vobiz (two fake accounts) and ClickUp, and checks sign-in and provisioning per account, multi-tenant webhook routing, the call XML, ClickUp tasks, account-scoped recordings and the security properties.
 
 ### 8.2 Manual Acceptance Criteria
 - [x] Outbound call placed from Softphone UI dials target PSTN number (`+15550192834`).

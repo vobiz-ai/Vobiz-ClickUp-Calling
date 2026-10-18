@@ -23,7 +23,7 @@
         </div>
         <span class="call-done-badge">Inbound Call Completed</span>
         <h3 class="call-done-title">Call Finished</h3>
-        <p id="inboundDoneCaller" class="call-done-caller">+1 000 000 0000</p>
+        <p id="inboundDoneCaller" class="call-done-caller">—</p>
         
         <div class="call-done-stats">
           <div class="call-done-stat-item">
@@ -89,7 +89,7 @@
       </div>
 
       <div class="panel">
-        <!-- Step 1 — Sign In (Dual Login) -->
+        <!-- Step 1 — Sign In with any Vobiz account -->
         <section class="step">
           <div class="step-head">
             <div class="step-title-row">
@@ -98,22 +98,23 @@
             </div>
           </div>
 
-          <!-- Dual Login Tabs -->
+          <!-- Two ways to sign in -->
           <div class="tabs" role="tablist" aria-label="How to sign in">
             <button type="button" id="mode-account-tab" class="tab is-active" role="tab" aria-selected="true" aria-controls="mode-account">
               Vobiz account
             </button>
             <button type="button" id="mode-sip-tab" class="tab" role="tab" aria-selected="false" aria-controls="mode-sip">
-              SIP direct
+              SIP Direct
             </button>
           </div>
 
-          <!-- Tab 1: Vobiz Account Mode -->
+          <!-- Tab 1: Vobiz account — any account can sign in -->
           <div id="mode-account" role="tabpanel" aria-labelledby="mode-account-tab">
             <p class="step-help">
               Your Auth ID and Auth Token are on the
               <a href="https://console.vobiz.ai" target="_blank" rel="noopener">Console dashboard</a>,
               under <strong>API credentials</strong>. The Auth Token is not your login password.
+              Signing in sets up this agent's softphone endpoint in your account; the token stays on the server.
             </p>
 
             <div id="vobiz-login-form">
@@ -165,9 +166,11 @@
 
             <div class="form-group">
               <label class="field-label" for="sip-caller-id">Calling From (Caller ID)</label>
-              <input type="tel" id="sip-caller-id" class="input input-mono" placeholder="+15550100000" autocomplete="off" />
+              <input type="tel" id="sip-caller-id" class="input input-mono" placeholder="+91…" autocomplete="off" />
               <p class="hint">
-                The number outgoing calls show. Carriers reject a call without a real one.
+                A number on the same Vobiz account as this endpoint. Outgoing calls show it, and
+                inbound calls to it ring this softphone once the endpoint and number are attached to an
+                application whose answer URL is this backend.
               </p>
             </div>
 
@@ -194,7 +197,7 @@
           </div>
         </section>
 
-        <!-- Step 2 — Caller ID (Account Mode) -->
+        <!-- Step 2 — Caller ID, from the signed-in account's numbers (Vobiz account mode) -->
         <section class="step" id="step-caller-id">
           <div class="step-head">
             <div class="step-title-row">
@@ -206,8 +209,15 @@
             The Vobiz number your calls go out from. Carriers require a real number here to bridge calls to mobile or landline.
           </p>
           <div class="form-group">
-            <select id="vobiz-number-select" class="input"></select>
+            <select id="vobiz-number-select" class="input" disabled>
+              <option value="">Sign in to load your numbers</option>
+            </select>
           </div>
+          <button id="enable-inbound-btn" class="btn btn-outline" type="button" disabled title="Attach the selected number to this integration's Vobiz application, so calls to it ring this softphone. This moves the number off any other application.">
+            Enable inbound calls
+          </button>
+          <p id="inbound-status" class="hint"></p>
+          <p id="sip-mode-note" class="hint" hidden>Signed in with SIP Direct: calls go out from the caller ID you entered. Sign in with your Vobiz account to use the number list, recordings and Enable inbound calls.</p>
         </section>
 
         <!-- Step 3 — Place a Call -->
@@ -366,9 +376,9 @@
         </div>
 
         <div class="faq-item">
-          <h3>What is Dual Login?</h3>
+          <h3>Which Vobiz account can I sign in with?</h3>
           <p>
-            You can sign in using your account-wide <strong>Vobiz Auth ID & Auth Token</strong> to auto-load your phone numbers, or enter your endpoint's <strong>SIP username & password</strong> for direct SIP registration.
+            Any. <strong>Vobiz account</strong>: sign in with your own Auth ID & Auth Token; the backend checks them with Vobiz, sets up a SIP endpoint for you in that account, and loads your numbers. Use <strong>Enable inbound calls</strong> once to route a number's incoming calls here. <strong>SIP Direct</strong>: enter an existing endpoint's SIP username and password and a caller ID from the same account; recordings and the number list need the account sign-in.
           </p>
         </div>
 

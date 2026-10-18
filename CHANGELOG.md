@@ -4,6 +4,46 @@ Notable changes to this integration. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and the project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - Unreleased
+
+### Changed — any Vobiz account can sign in
+- **Nothing account-specific is configured on the server.** `VOBIZ_AUTH_ID`,
+  `VOBIZ_AUTH_TOKEN`, `VOBIZ_FROM_NUMBER`, `VOBIZ_SIP_USER` and
+  `VOBIZ_SIP_PASSWORD` are gone from the code, `.env.example` and the docs. This
+  replaces 2.0.1's "bound to the configured account" model.
+- **Vobiz account sign-in** checks the Auth ID / Auth Token with Vobiz, then in
+  that account finds or creates this integration's application (matched on its
+  `answer_url`; others are never repointed), finds or creates one endpoint per
+  agent, sets a fresh SIP password per sign-in, and binds the endpoint to the
+  application (`{"app_id":"<id>"}`, verified, falling back to
+  `{"application": <id>}`). 17-digit app ids stay strings end to end.
+- **The Auth Token is held in memory only**, keyed by Auth ID. The
+  `account:agent → endpoint` map is kept in `backend/data/endpoints.json`
+  (gitignored, 0600), with no secrets.
+- **Caller ID** is a dropdown of the account's active, voice-enabled numbers,
+  loaded across all pages; the backend refuses anything else.
+- **Enable inbound calls** attaches the selected number to the integration's
+  application, on request only.
+- **SIP Direct** keeps working with zero server config: an existing endpoint's
+  SIP credentials, typed in the panel, plus a caller ID. Account-API features
+  ask for the account sign-in.
+- **Webhooks are multi-tenant.** Outbound is matched by SIP user; inbound by
+  `ParentAuthID`, then by the dialled number. No match: a polite hangup.
+- **Recording links name their account** inside the HMAC, so one account's
+  link cannot fetch another's audio.
+
+### Removed
+- `scripts/create-vobiz-app-and-endpoint.js` (`npm run provision`) — sign-in
+  provisions now.
+- `scripts/fetch-cdr.js` and `scripts/test-clickup-sync.js` (`npm run fetch-cdr`,
+  `test:*`) — they read account credentials from `.env`. Use **Sync CDRs** in the
+  panel, and `npm test`.
+
+### Tests
+- The Vobiz stand-in holds two fake accounts with distinct tokens, numbers,
+  applications and endpoints, rewrites endpoint usernames, pages the numbers
+  list and returns 17-digit app ids as bare JSON numbers. 130 assertions.
+
 ## [2.0.1] - Unreleased
 
 ### Security

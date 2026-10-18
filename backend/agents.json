@@ -1,13 +1,11 @@
 {
   "admin": {
     "name": "System Administrator",
-    "sipUser": "admin@sip.vobiz.ai",
     "clickUpUserId": "12345678",
     "clickUpEmail": "admin@vobiz.ai"
   },
   "agent1": {
     "name": "John Doe",
-    "sipUser": "john.doe@sip.vobiz.ai",
     "clickUpUserId": "87654321",
     "clickUpEmail": "john.doe@vobiz.ai"
   }
