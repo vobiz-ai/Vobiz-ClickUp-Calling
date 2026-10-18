@@ -45,13 +45,12 @@ const VOBIZ_SIP_PASSWORD = cleanEnvVar(process.env.VOBIZ_SIP_PASSWORD) || "";
 const VOBIZ_REGISTRAR = cleanEnvVar(process.env.VOBIZ_REGISTRAR) || "registrar.vobiz.ai";
 
 const CLICKUP_API_TOKEN = cleanEnvVar(process.env.CLICKUP_API_TOKEN);
-const CLICKUP_TEAM_ID = cleanEnvVar(process.env.CLICKUP_TEAM_ID);
 const CLICKUP_LIST_ID = cleanEnvVar(process.env.CLICKUP_LIST_ID);
 const CLICKUP_API_URL = cleanEnvVar(process.env.CLICKUP_API_URL) || "https://api.clickup.com/api/v2";
+const CLICKUP_TASK_STATUS = cleanEnvVar(process.env.CLICKUP_TASK_STATUS);
 
 const SIGNING_SECRET = cleanEnvVar(process.env.SIGNING_SECRET) || crypto.randomBytes(32).toString("hex");
 const RECORDING_URL_TTL_SECONDS = Number(cleanEnvVar(process.env.RECORDING_URL_TTL_SECONDS) || 900);
-const ALLOW_MOCK = cleanEnvVar(process.env.ALLOW_MOCK) === "1" || !VOBIZ_AUTH_ID || VOBIZ_AUTH_ID.includes("YOUR_");
 
 const TUNNEL_URL_FILE = path.join(__dirname, "tunnel-url.txt");
 
@@ -277,6 +276,58 @@ function requireSession(req, res) {
   return false;
 }
 
+/**
+ * Guard for routes that read account data (recordings, CDRs, ClickUp tasks) or
+ * spend money. A SIP-direct session is not enough: /login-sip proves only that
+ * the caller knows one of the account's numbers, which is public — it is the
+ * number customers dial. Those sessions register their own endpoint and make
+ * calls over SIP; they get nothing that belongs to the account.
+ */
+function requireAccountSession(req, res) {
+  const s = getSession(req);
+  if (!s) {
+    res.writeHead(401, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Sign in first" }));
+    return false;
+  }
+  if (s.mode === "sip") {
+    res.writeHead(403, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Sign in with the Vobiz account to use this. SIP-direct sessions can only place and take calls." }));
+    return false;
+  }
+  return true;
+}
+
+function serverAccountConfigured() {
+  return !!(VOBIZ_AUTH_ID && VOBIZ_AUTH_TOKEN && !VOBIZ_AUTH_ID.includes("YOUR_"));
+}
+
+function safeEqual(a, b) {
+  const x = Buffer.from(String(a || ""));
+  const y = Buffer.from(String(b || ""));
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
+}
+
+/** Numbers this account owns, as E.164. Empty when they could not be loaded. */
+function ownedNumbers() {
+  const list = [...cachedAccountNumbers];
+  if (process.env.VOBIZ_FROM_NUMBER) list.push(VOBIZ_FROM_NUMBER);
+  return list.map(toE164).filter(Boolean);
+}
+
+/**
+ * A caller ID is acceptable only if the account owns it. When the number list
+ * could not be loaded, fall back to VOBIZ_FROM_NUMBER rather than trusting the
+ * caller.
+ */
+function ownedCallerId(candidate) {
+  const owned = ownedNumbers();
+  const wanted = toE164(candidate);
+  if (!wanted) return "";
+  if (owned.length === 0) return "";
+  return owned.includes(wanted) ? wanted : "";
+}
+
 function readJsonBody(req) {
   return new Promise((resolve, reject) => {
     let raw = "";
@@ -327,7 +378,7 @@ async function searchClickUpTaskByPhone(phone) {
 }
 
 async function createClickUpCallTask(callData, publicBaseUrl) {
-  const {
+  let {
     callUuid,
     direction = "Outbound",
     from = VOBIZ_FROM_NUMBER,
@@ -338,7 +389,15 @@ async function createClickUpCallTask(callData, publicBaseUrl) {
     recordingId = "",
     hangupCause = "NORMAL_CLEARING",
     status = "COMPLETE",
+    existingTaskId = "",
   } = callData;
+
+  // Webhook values land in Markdown inside inline code; a backtick, pipe or
+  // newline would break out of the table cell and inject links into the task.
+  const md = (v) => String(v == null ? "" : v).replace(/[`|\r\n\[\]()<>]/g, "").slice(0, 120);
+  ({ callUuid, from, to, hangupCause, status } = {
+    callUuid: md(callUuid), from: md(from), to: md(to), hangupCause: md(hangupCause), status: md(status),
+  });
 
   const base = publicBaseUrl || `http://localhost:${PORT}`;
   let proxiedRecordingUrl = "";
@@ -397,19 +456,30 @@ ${
   }
 
   try {
+    // Status is left to the list's default unless CLICKUP_TASK_STATUS names
+    // one: ClickUp rejects a status the list does not define, and a hardcoded
+    // "CONNECTED" failed every write to a list created with ClickUp's defaults.
     const payload = {
       name: taskTitle,
       description: markdownDescription,
-      status: "CONNECTED",
+      ...(CLICKUP_TASK_STATUS ? { status: CLICKUP_TASK_STATUS } : {}),
       priority: 3,
       tags: ["vobiz-call", direction.toLowerCase(), "cdr"],
     };
 
-    const res = await fetch(`${CLICKUP_API_URL}/list/${CLICKUP_LIST_ID}/task`, {
-      method: "POST",
-      headers: getClickUpHeaders(),
-      body: JSON.stringify(payload),
-    });
+    // One task per call: the dial result creates it, and the recording, which
+    // arrives separately, updates the same task instead of adding a second.
+    const res = existingTaskId
+      ? await fetch(`${CLICKUP_API_URL}/task/${encodeURIComponent(existingTaskId)}`, {
+          method: "PUT",
+          headers: getClickUpHeaders(),
+          body: JSON.stringify({ name: taskTitle, description: markdownDescription }),
+        })
+      : await fetch(`${CLICKUP_API_URL}/list/${CLICKUP_LIST_ID}/task`, {
+          method: "POST",
+          headers: getClickUpHeaders(),
+          body: JSON.stringify(payload),
+        });
 
     const resText = await res.text();
     let json;
@@ -424,12 +494,29 @@ ${
       return { error: resText, status: res.status };
     }
 
-    console.log(`[ClickUp] ✅ Task created successfully! ID: ${json.id}, URL: ${json.url}`);
+    console.log(`[ClickUp] ✅ Task ${existingTaskId ? "updated" : "created"} successfully! ID: ${json.id}, URL: ${json.url}`);
     return json;
   } catch (err) {
     console.error("[ClickUp] Network error creating task:", err.message);
     return { error: err.message };
   }
+}
+
+/**
+ * Create the call's ClickUp task, or update it if one already exists.
+ * Calls are serialised per call record so that a dial result and a recording
+ * callback arriving together cannot both create a task.
+ */
+function syncCallTask(rec, callData, publicBaseUrl) {
+  const previous = rec.taskPromise;
+  rec.taskPromise = (async () => {
+    const existing = previous ? await previous.catch(() => null) : null;
+    const existingTaskId = existing && !existing.simulated && !existing.error ? existing.id : "";
+    const result = await createClickUpCallTask({ ...callData, existingTaskId }, publicBaseUrl);
+    // Keep the earlier task id if an update failed, so a later event still updates.
+    return result && result.id ? result : existing || result;
+  })();
+  return rec.taskPromise;
 }
 
 /**
@@ -588,9 +675,15 @@ const server = http.createServer(async (req, res) => {
       // The numbers lookup below is not proof: it is allowed to fail, and a
       // sign-in that treated it as validation would admit anyone who typed
       // anything.
+      //
+      // This backend is bound to one account. When that account is configured,
+      // only its own credentials sign in: any other valid Vobiz account would
+      // otherwise get a session here, and with it this server's SIP password,
+      // recordings and CDRs, all of which belong to the configured account.
       let isValid = false;
-      if (VOBIZ_AUTH_ID && authId === VOBIZ_AUTH_ID && authToken === VOBIZ_AUTH_TOKEN) {
-        isValid = true;
+      if (serverAccountConfigured()) {
+        isValid = authId === VOBIZ_AUTH_ID && safeEqual(authToken, VOBIZ_AUTH_TOKEN);
+        if (!isValid) console.log(`[backend] Refused sign-in for ${authId}: not this server's Vobiz account`);
       } else {
         try {
           // 405 means the resource exists and rejected the verb, which still
@@ -638,7 +731,14 @@ const server = http.createServer(async (req, res) => {
       let sipPassword = VOBIZ_SIP_PASSWORD || "";
       let sipAvailable = false;
 
-      try {
+      // VOBIZ_SIP_USER and VOBIZ_SIP_PASSWORD are a pair. Discovery used to
+      // replace the configured user with the account's first endpoint while
+      // keeping the configured password, so on any account with more than one
+      // endpoint the softphone registered with the wrong username. Discover only
+      // when no SIP user is configured.
+      if (cleanEnvVar(process.env.VOBIZ_SIP_USER)) {
+        sipAvailable = !!VOBIZ_SIP_PASSWORD;
+      } else try {
         const endRes = await fetch(`${VOBIZ_API_URL}/api/v1/Account/${encodeURIComponent(authId)}/Endpoint/`, {
           headers: authHeaders,
         });
@@ -703,11 +803,10 @@ const server = http.createServer(async (req, res) => {
       // The caller ID is what the customer's handset displays and what the
       // carrier bills against. Accepting an arbitrary string here let anyone
       // who could reach the tunnel set the number this account dials out as.
+      // An empty owned list refuses rather than accepts: "could not check" is
+      // not "allowed".
       if (cachedAccountNumbers.length === 0) await refreshAccountNumbers();
-      const owned = [...cachedAccountNumbers];
-      if (VOBIZ_FROM_NUMBER) owned.push(VOBIZ_FROM_NUMBER);
-      const wanted = toE164(callerId);
-      if (owned.length > 0 && !owned.some((n) => toE164(n) === wanted)) {
+      if (!ownedCallerId(callerId)) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(
           JSON.stringify({ error: `${callerId} is not a number on this Vobiz account, so it cannot be a caller ID.` })
@@ -778,13 +877,20 @@ const server = http.createServer(async (req, res) => {
     if (!requireSession(req, res)) return;
     try {
       const body = await readJsonBody(req);
-      const { number, agentId = "admin" } = body;
       const s = getSession(req);
-      if (s) {
-        s.from = number;
+      if (cachedAccountNumbers.length === 0) await refreshAccountNumbers();
+      const number = ownedCallerId(body.number);
+      if (!number) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: `${body.number} is not a number on this Vobiz account, so it cannot be a caller ID.` }));
+        return;
       }
-      const cleanUser = String(VOBIZ_SIP_USER || agentId).replace(/^sip:/, "").split("@")[0];
-      fromBySipUser.set(cleanUser, number);
+      s.from = number;
+      // Map the caller ID to the SIP user this session actually registers as,
+      // which is what /answer sees in From — not to whatever agent id was sent.
+      const sessionSipUser = s.mode === "sip" ? s.agentId : s.sipUser || VOBIZ_SIP_USER;
+      const cleanUser = String(sessionSipUser || "").replace(/^sip:/, "").split("@")[0];
+      if (cleanUser) fromBySipUser.set(cleanUser, number);
 
       console.log(`[backend] Outbound Caller ID updated to ${number} for ${cleanUser}`);
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -841,107 +947,34 @@ const server = http.createServer(async (req, res) => {
 
   // 2g. List Agents
   if (pathname === "/api/agents" && method === "GET") {
-    if (!requireSession(req, res)) return;
+    if (!requireAccountSession(req, res)) return;
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(getAllAgents()));
     return;
   }
 
-  // 2h. Start API Call Session (Triggers real Vobiz Outbound Call API to dial the destination phone)
+  // 2h. /api/calls/start no longer originates calls.
+  //
+  // It used to POST /Call/ to ring the customer from the account DID, with
+  // /answer as the answer URL. That is the design that cannot work: /answer
+  // sees a PSTN From, takes the inbound branch and bridges with <Dial><User>,
+  // and the customer answers into ringback and then "agent offline". The
+  // softphone is the A leg: it sends the INVITE itself once registered.
   if (pathname === "/api/calls/start" && method === "POST") {
-    if (!requireSession(req, res)) return;
-    try {
-      const body = await readJsonBody(req);
-      const s = getSession(req);
-      const agentId = body.agentId || (s ? s.agentId : "admin");
-      const from = body.from || (s ? s.from : VOBIZ_FROM_NUMBER);
-      const to = body.to || "";
-      const direction = body.direction || "Outbound";
-      const publicBaseUrl = getPublicBaseUrl(req);
-      let callUuid = `call_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-
-      // Credentials come from the session or the server's own config, never
-      // from the request body: reading them from the body let an unauthenticated
-      // caller place calls billed to this account, and steered whose they were.
-      const authId = (s && s.authId) || VOBIZ_AUTH_ID;
-      const authToken = (s && s.authToken) || VOBIZ_AUTH_TOKEN;
-
-      let vobizCallResult = null;
-
-      if (authId && authToken && !authId.includes("YOUR_") && to) {
-        try {
-          const vobizCallUrl = `${VOBIZ_API_URL}/api/v1/Account/${encodeURIComponent(authId)}/Call/`;
-          const callPayload = {
-            from: from,
-            to: to,
-            answer_url: `${publicBaseUrl}/answer`,
-            answer_method: "POST",
-            hangup_url: `${publicBaseUrl}/dial-status`,
-            hangup_method: "POST",
-          };
-
-          console.log(`[backend] 📞 Placing real Outbound call from ${from} to ${to} via Vobiz API...`);
-
-          const callRes = await fetch(vobizCallUrl, {
-            method: "POST",
-            headers: {
-              "X-Auth-ID": authId,
-              "X-Auth-Token": authToken,
-              "Content-Type": "application/json",
-              Accept: "application/json",
-            },
-            body: JSON.stringify(callPayload),
-          });
-
-          const resText = await callRes.text();
-          try {
-            vobizCallResult = JSON.parse(resText);
-          } catch (_) {
-            vobizCallResult = { message: resText };
-          }
-
-          console.log(`[backend] Vobiz Call API response [${callRes.status}]:`, vobizCallResult);
-
-          if (vobizCallResult.request_uuid || vobizCallResult.call_uuid) {
-            callUuid = vobizCallResult.request_uuid || vobizCallResult.call_uuid;
-          }
-        } catch (apiErr) {
-          console.error("[backend] Vobiz Outbound Call API error:", apiErr.message);
-        }
-      }
-
-      const record = {
-        callUuid,
-        direction,
-        agentSipUser: agentId,
-        from,
-        to,
-        startedAt: Date.now(),
-        vobizResponse: vobizCallResult,
-      };
-      rememberCall(record);
-      console.log(`[backend] 📞 Registered ${direction} API call session: ${callUuid} (from ${from} to ${to})`);
-
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
-          ok: true,
-          success: true,
-          callUuid,
-          record,
-          vobizResponse: vobizCallResult,
-        })
-      );
-    } catch (err) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: err.message }));
-    }
+    if (!requireAccountSession(req, res)) return;
+    res.writeHead(409, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify({
+        ok: false,
+        error: "Calls are placed by the softphone over WebRTC. Wait for the status to read Ready, then dial.",
+      })
+    );
     return;
   }
 
   // 2i. End API Call Session and sync task to ClickUp
   if (pathname === "/api/calls/end" && method === "POST") {
-    if (!requireSession(req, res)) return;
+    if (!requireAccountSession(req, res)) return;
     try {
       const body = await readJsonBody(req);
       const s = getSession(req);
@@ -1011,8 +1044,10 @@ const server = http.createServer(async (req, res) => {
       const to = String(params.To || params.to || "");
       const routeType = String(params.RouteType || params.routetype || "").toLowerCase();
 
-      // Browser is the A leg when 'from' is a sip: URI or routeType is sip
-      const fromBrowser = from.startsWith("sip:") || routeType === "sip";
+      // Browser is the A leg when 'from' is a sip: URI, routeType is sip, or
+      // From is the bare username of an endpoint this server knows.
+      const knownSipUsers = new Set([VOBIZ_SIP_USER, ...fromBySipUser.keys()].filter(Boolean));
+      const fromBrowser = from.startsWith("sip:") || routeType === "sip" || knownSipUsers.has(from);
 
       const publicBaseUrl = getPublicBaseUrl(req);
       const dialStatusUrl = `${publicBaseUrl}/dial-status`;
@@ -1022,7 +1057,7 @@ const server = http.createServer(async (req, res) => {
 
       if (fromBrowser) {
         // OUTBOUND CALL from agent browser to customer PSTN
-        const sipUser = (from.match(/^sip:([^@]+)@/) || [])[1] || VOBIZ_SIP_USER || "admin";
+        const sipUser = (from.match(/^sip:([^@]+)@/) || [])[1] || (knownSipUsers.has(from) ? from : "") || VOBIZ_SIP_USER || "admin";
         const sipHeaderCallerId =
           params["SIPHeader_X-VH-Caller-ID"] ||
           params["SIPHeader_X-PH-Caller-ID"] ||
@@ -1031,7 +1066,11 @@ const server = http.createServer(async (req, res) => {
           params.CallerID ||
           params.caller_id;
 
-        const callerId = sipHeaderCallerId || fromBySipUser.get(sipUser) || VOBIZ_FROM_NUMBER;
+        // The header comes from the browser, so it is a request, not a fact:
+        // only a number the account owns is used as the caller ID.
+        if (cachedAccountNumbers.length === 0) await refreshAccountNumbers();
+        const callerId =
+          ownedCallerId(sipHeaderCallerId) || fromBySipUser.get(sipUser) || toE164(VOBIZ_FROM_NUMBER) || VOBIZ_FROM_NUMBER;
         const destination = to.replace(/[^\d+]/g, "");
 
         rememberCall({
@@ -1085,7 +1124,7 @@ const server = http.createServer(async (req, res) => {
   <Dial callerId="${callerId}" timeout="20" action="${dialStatusUrl}" method="POST" redirect="false">
     <User>sip:${targetSipUser}@${VOBIZ_REGISTRAR}</User>
   </Dial>
-  <Speak voice="Polly.Aditi" language="en-IN">The ClickUp softphone agent is currently offline. Your call has been recorded and logged to ClickUp. Goodbye!</Speak>
+  <Speak>Sorry, no one is available to take your call right now. Please try again later. Goodbye.</Speak>
 </Response>`;
 
       res.writeHead(200, { "Content-Type": "application/xml" });
@@ -1120,7 +1159,8 @@ const server = http.createServer(async (req, res) => {
         rec.endedAt = Date.now();
 
         // Create / update ClickUp task
-        await createClickUpCallTask(
+        await syncCallTask(
+          rec,
           {
             callUuid,
             direction: rec.direction || "Outbound",
@@ -1162,13 +1202,16 @@ const server = http.createServer(async (req, res) => {
 
       console.log(`[backend] 🎧 RECORDING READY: call=${callUuid} id=${recordingId} url=${recordUrl}`);
 
-      let rec = callsByUuid.get(callUuid) || {
-        callUuid,
-        direction: d.Direction || "Outbound",
-        from: d.From || VOBIZ_FROM_NUMBER,
-        to: d.To || "",
-        agentSipUser: "admin",
-      };
+      // Only calls this server answered get a task. This route is reachable by
+      // anyone who can reach the tunnel, so an unknown CallUUID is acknowledged
+      // and ignored rather than turned into a ClickUp task.
+      const rec = callsByUuid.get(callUuid);
+      if (!rec) {
+        console.warn(`[backend] recording callback for unknown call ${callUuid}; ignored`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
 
       rec.recordingId = recordingId;
       rec.recordingUrl = recordUrl;
@@ -1178,14 +1221,15 @@ const server = http.createServer(async (req, res) => {
       const publicBaseUrl = getPublicBaseUrl(req);
 
       // Create or update ClickUp call task with recording link
-      const clickUpResult = await createClickUpCallTask(
+      await syncCallTask(
+        rec,
         {
           callUuid,
           direction: rec.direction,
           from: rec.from,
           to: rec.to,
           agentId: rec.agentSipUser,
-          durationSeconds: recordingDuration || rec.duration || 30,
+          durationSeconds: rec.duration || recordingDuration || 0,
           recordingUrl: recordUrl,
           recordingId: recordingId,
           hangupCause: rec.hangupCause || "NORMAL_CLEARING",
@@ -1193,8 +1237,10 @@ const server = http.createServer(async (req, res) => {
         publicBaseUrl
       );
 
+      // The task result is not echoed: it carries a freshly signed playback
+      // link, and this route is unauthenticated.
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true, clickUpResult }));
+      res.end(JSON.stringify({ ok: true }));
     } catch (err) {
       console.error("[backend] Error in recording webhook:", err);
       res.writeHead(200);
@@ -1227,7 +1273,7 @@ const server = http.createServer(async (req, res) => {
 
   // 7. Recordings List Endpoint: GET /recordings or GET /api/recordings
   if ((pathname === "/recordings" || pathname === "/api/recordings") && method === "GET") {
-    if (!requireSession(req, res)) return;
+    if (!requireAccountSession(req, res)) return;
     try {
       const publicBaseUrl = getPublicBaseUrl(req);
       const limit = Math.min(Number(parsedUrl.query.limit || 15), 50);
@@ -1297,7 +1343,9 @@ const server = http.createServer(async (req, res) => {
   if (pathname.startsWith("/recording-audio/") && method === "GET") {
     const recordingId = decodeURIComponent(pathname.slice("/recording-audio/".length));
     const { exp, sig } = parsedUrl.query;
-    if (!verifyRecordingSignature(recordingId, exp, sig) && !getSession(req)) {
+    const viewer = getSession(req);
+    const accountViewer = viewer && viewer.mode !== "sip";
+    if (!verifyRecordingSignature(recordingId, exp, sig) && !accountViewer) {
       res.writeHead(403, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Invalid or expired playback signature" }));
       return;
@@ -1329,7 +1377,7 @@ const server = http.createServer(async (req, res) => {
 
   // 11. ClickUp Task Search Endpoint: GET /api/clickup/search-task?phone=...
   if (pathname === "/api/clickup/search-task" && method === "GET") {
-    if (!requireSession(req, res)) return;
+    if (!requireAccountSession(req, res)) return;
     const phone = parsedUrl.query.phone || "";
     try {
       const task = await searchClickUpTaskByPhone(phone);
@@ -1360,7 +1408,7 @@ const server = http.createServer(async (req, res) => {
 
   // 12. Live CDR Sync Endpoint: GET/POST /sync-recent-cdrs
   if (pathname === "/sync-recent-cdrs" && (method === "GET" || method === "POST")) {
-    if (!requireSession(req, res)) return;
+    if (!requireAccountSession(req, res)) return;
     console.log(`[backend] Fetching live CDRs & recordings from Vobiz API for account ${VOBIZ_AUTH_ID}...`);
     const publicBaseUrl = getPublicBaseUrl(req);
 
@@ -1425,7 +1473,7 @@ const server = http.createServer(async (req, res) => {
 
   // 13. Simulated Call Test Endpoint: POST /test-simulated-call
   if (pathname === "/test-simulated-call" && method === "POST") {
-    if (!requireSession(req, res)) return;
+    if (!requireAccountSession(req, res)) return;
     try {
       const body = await readJsonBody(req);
       const direction = body.direction || "outbound";
