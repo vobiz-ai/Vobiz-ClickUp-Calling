@@ -251,8 +251,9 @@ tasks, and assign each agent's tasks to them in ClickUp, copy
 
 The panel reads the list from the backend (`GET /api/agent-profiles`, which
 returns only IDs and names), so there is nothing to change in the page.
-`clickUpUserId` is the agent's numeric ClickUp user ID; without it, that agent's
-tasks are not assigned. An agent ID that is not in the file still works: its
+`clickUpUserId` is the agent's numeric ClickUp user ID (the number after `pk_` in
+that user's personal API token, or from the ClickUp API's `GET /user`). The
+example file leaves it out; without it, that agent's tasks are not assigned. An agent ID that is not in the file still works: its
 tasks show the ID and are not assigned.
 
 ---

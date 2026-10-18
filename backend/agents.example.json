@@ -1,12 +1,4 @@
 {
-  "admin": {
-    "name": "System Administrator",
-    "clickUpUserId": "12345678",
-    "clickUpEmail": "admin@vobiz.ai"
-  },
-  "agent1": {
-    "name": "John Doe",
-    "clickUpUserId": "87654321",
-    "clickUpEmail": "john.doe@vobiz.ai"
-  }
+  "priya": { "name": "Priya Sharma" },
+  "rahul": { "name": "Rahul Verma" }
 }
