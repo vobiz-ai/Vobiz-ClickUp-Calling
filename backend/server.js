@@ -50,6 +50,9 @@ const cleanEnvVar = (val) => val?.trim().replace(/^["']|["']$/g, "") || "";
 const PORT = Number(cleanEnvVar(process.env.PORT) || 8092);
 const VOBIZ_API_URL = (cleanEnvVar(process.env.VOBIZ_API_URL) || "https://api.vobiz.ai").replace(/\/+$/, "");
 const VOBIZ_REGISTRAR = cleanEnvVar(process.env.VOBIZ_REGISTRAR) || "registrar.vobiz.ai";
+// The softphone's WebSocket registrar. The browser is told this (and the SIP
+// domain above) by /health, so the page never carries a registrar of its own.
+const VOBIZ_REGISTRAR_WSS = `wss://${VOBIZ_REGISTRAR}:5063/`;
 const DATA_DIR = path.resolve(cleanEnvVar(process.env.DATA_DIR) || path.join(__dirname, "data"));
 const APP_NAME = "Vobiz ClickUp Calling";
 
@@ -79,19 +82,39 @@ function getPublicBaseUrl(req) {
   return `http://localhost:${PORT}`;
 }
 
-const AGENTS_FILE = path.join(__dirname, "agents.json");
+// Optional. Maps an agent ID to a display name and the ClickUp user that the
+// agent's call tasks are assigned to. Without it, agents type any agent ID and
+// tasks are left unassigned.
+const AGENTS_FILE = path.resolve(cleanEnvVar(process.env.AGENTS_FILE) || path.join(__dirname, "agents.json"));
+
+// An agent ID names the agent's SIP endpoint (its alias) and its entry in the
+// endpoint map, so it is kept to characters the alias keeps.
+const AGENT_ID_RE = /^[A-Za-z0-9_-]{1,30}$/;
 
 function getAllAgents() {
   try {
     if (fs.existsSync(AGENTS_FILE)) {
-      return JSON.parse(fs.readFileSync(AGENTS_FILE, "utf8"));
+      const parsed = JSON.parse(fs.readFileSync(AGENTS_FILE, "utf8"));
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+      console.error("[backend] agents.json is not an object of agent profiles; ignoring it");
     }
   } catch (err) {
     console.error("[backend] Error reading agents.json:", err.message);
   }
-  return {
-    admin: { name: "System Administrator", clickUpUserId: "", clickUpEmail: "" },
-  };
+  return {};
+}
+
+/** Profiles the sign-in form may suggest: id and display name only. */
+function listAgentProfiles() {
+  return Object.entries(getAllAgents())
+    .filter(([id, a]) => AGENT_ID_RE.test(id) && a && typeof a === "object")
+    .map(([id, a]) => ({ id, name: typeof a.name === "string" ? a.name : "" }));
+}
+
+/** The ClickUp user id to assign this agent's call tasks to, or "". */
+function clickUpAssigneeFor(agentId) {
+  const id = String(getAgent(agentId).clickUpUserId || "").trim();
+  return /^\d{1,15}$/.test(id) ? id : "";
 }
 
 /**
@@ -273,6 +296,52 @@ function writeEndpointStore(store) {
   try {
     fs.chmodSync(ENDPOINTS_FILE, 0o600);
   } catch (_) {}
+}
+
+// ─── Synced-call store ──────────────────────────────────────────────────────
+// authId -> [callUuid, …]: calls that already have a ClickUp task, whether the
+// live webhooks made it or "Sync CDRs" did. "Sync CDRs" skips these, so it can
+// be pressed any number of times without duplicating tasks.
+const SYNCED_FILE = path.join(DATA_DIR, "synced-calls.json");
+const SYNCED_PER_ACCOUNT = 5000;
+
+function readSyncedStore() {
+  try {
+    if (fs.existsSync(SYNCED_FILE)) {
+      const parsed = JSON.parse(fs.readFileSync(SYNCED_FILE, "utf8"));
+      if (parsed && typeof parsed === "object") return parsed;
+    }
+  } catch (err) {
+    console.error("[backend] synced-calls.json unreadable, starting empty:", err.message);
+  }
+  return {};
+}
+
+function isCallSynced(authId, callUuid) {
+  if (!authId || !callUuid) return false;
+  const list = readSyncedStore()[authId];
+  return Array.isArray(list) && list.includes(String(callUuid));
+}
+
+function markCallSynced(authId, callUuid) {
+  if (!authId || !callUuid) return;
+  const store = readSyncedStore();
+  const list = Array.isArray(store[authId]) ? store[authId] : [];
+  if (list.includes(String(callUuid))) return;
+  list.push(String(callUuid));
+  store[authId] = list.slice(-SYNCED_PER_ACCOUNT);
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(SYNCED_FILE, JSON.stringify(store), { mode: 0o600 });
+    fs.chmodSync(SYNCED_FILE, 0o600);
+  } catch (err) {
+    console.error("[backend] could not record a synced call:", err.message);
+  }
+}
+
+/** A task that really exists in ClickUp (not simulated, not an error). */
+function isRealTask(task) {
+  return Boolean(task && task.id && !task.simulated && !task.error);
 }
 
 // ─── Per-sign-in provisioning ───────────────────────────────────────────────
@@ -619,7 +688,7 @@ async function createClickUpCallTask(callData, publicBaseUrl) {
     authId = "",
     from = "",
     to = "",
-    agentId = "admin",
+    agentId = "",
     durationSeconds = 0,
     recordingUrl = "",
     recordingId = "",
@@ -660,7 +729,7 @@ async function createClickUpCallTask(callData, publicBaseUrl) {
 | **Direction** | \`${dirLabel}\` |
 | **From** | \`${from}\` |
 | **To** | \`${to}\` |
-| **Agent** | \`${agentObj ? agentObj.name : agentId}\` |
+| **Agent** | \`${md(agentId ? agentObj.name || agentId : "Unassigned")}\` |
 | **Duration** | \`${formattedDuration}\` (${durationSeconds}s) |
 | **Hangup Cause** | \`${hangupCause}\` |
 | **Status** | \`${status.toUpperCase()}\` |
@@ -697,27 +766,41 @@ ${
     // Status is left to the list's default unless CLICKUP_TASK_STATUS names
     // one: ClickUp rejects a status the list does not define, and a hardcoded
     // "CONNECTED" failed every write to a list created with ClickUp's defaults.
+    // The agent's ClickUp user, from agents.json, owns the task. With no
+    // clickUpUserId on file the task is left unassigned.
+    const assignee = clickUpAssigneeFor(agentId);
     const payload = {
       name: taskTitle,
       description: markdownDescription,
       ...(CLICKUP_TASK_STATUS ? { status: CLICKUP_TASK_STATUS } : {}),
+      ...(assignee ? { assignees: [Number(assignee)] } : {}),
       priority: 3,
       tags: ["vobiz-call", direction.toLowerCase(), "cdr"],
     };
+    const createTask = (body) =>
+      fetch(`${CLICKUP_API_URL}/list/${CLICKUP_LIST_ID}/task`, {
+        method: "POST",
+        headers: getClickUpHeaders(),
+        body: JSON.stringify(body),
+      });
 
     // One task per call: the dial result creates it, and the recording, which
     // arrives separately, updates the same task instead of adding a second.
-    const res = existingTaskId
+    let res = existingTaskId
       ? await fetch(`${CLICKUP_API_URL}/task/${encodeURIComponent(existingTaskId)}`, {
           method: "PUT",
           headers: getClickUpHeaders(),
           body: JSON.stringify({ name: taskTitle, description: markdownDescription }),
         })
-      : await fetch(`${CLICKUP_API_URL}/list/${CLICKUP_LIST_ID}/task`, {
-          method: "POST",
-          headers: getClickUpHeaders(),
-          body: JSON.stringify(payload),
-        });
+      : await createTask(payload);
+
+    // A clickUpUserId that is not a member of the workspace makes ClickUp
+    // refuse the whole task. The call is still logged, unassigned.
+    if (!existingTaskId && assignee && res.status === 400) {
+      console.warn(`[ClickUp] ClickUp refused assignee ${assignee} for agent '${agentId}'; creating the task unassigned`);
+      const { assignees, ...unassigned } = payload;
+      res = await createTask(unassigned);
+    }
 
     const resText = await res.text();
     let json;
@@ -751,6 +834,7 @@ function syncCallTask(rec, callData, publicBaseUrl) {
     const existing = previous ? await previous.catch(() => null) : null;
     const existingTaskId = existing && !existing.simulated && !existing.error ? existing.id : "";
     const result = await createClickUpCallTask({ ...callData, existingTaskId }, publicBaseUrl);
+    if (isRealTask(result)) markCallSynced(callData.authId, callData.callUuid);
     // Keep the earlier task id if an update failed, so a later event still updates.
     return result && result.id ? result : existing || result;
   })();
@@ -836,6 +920,101 @@ async function streamRecordingById(authId, recordingId, res) {
   }
 }
 
+// ─── CDR sync ───────────────────────────────────────────────────────────────
+const CDR_SYNC_LIMIT = 5;
+const cdrSyncs = new Map(); // authId -> in-flight sync
+
+/** The recording for a call: from this server's own webhook, else from Vobiz. */
+async function recordingIdForCall(authId, authToken, callUuid) {
+  const local = callRecordings.get(callUuid) || callsByUuid.get(callUuid);
+  if (local && local.authId === authId && local.recordingId) return String(local.recordingId);
+  try {
+    const r = await vobiz(authId, authToken, "GET", `/Recording/?call_uuid=${encodeURIComponent(callUuid)}&limit=1`);
+    const objects = (r.ok && r.json && (r.json.objects || r.json.items)) || [];
+    const hit = objects.find((o) => o && o.recording_id && (!o.call_uuid || o.call_uuid === callUuid));
+    return hit ? String(hit.recording_id) : "";
+  } catch (err) {
+    console.warn(`[sync-cdrs] recording lookup for ${callUuid} failed: ${err.message}`);
+    return "";
+  }
+}
+
+/** Call UUIDs already present in task descriptions on the configured list. */
+async function callUuidsInClickUpList(uuids) {
+  const found = new Set();
+  if (!CLICKUP_API_TOKEN || !CLICKUP_LIST_ID || CLICKUP_API_TOKEN.includes("YOUR_CLICKUP")) return found;
+  try {
+    const res = await fetch(`${CLICKUP_API_URL}/list/${CLICKUP_LIST_ID}/task?include_closed=true`, {
+      headers: getClickUpHeaders(),
+    });
+    if (!res.ok) return found;
+    const json = await res.json().catch(() => ({}));
+    for (const t of (json && json.tasks) || []) {
+      const text = String((t && t.description) || "") + String((t && t.text_content) || "");
+      for (const u of uuids) if (text.includes(`\`${u}\``)) found.add(u);
+    }
+  } catch (err) {
+    console.warn("[sync-cdrs] could not read the ClickUp list:", err.message);
+  }
+  return found;
+}
+
+/**
+ * Import the account's most recent CDRs as ClickUp tasks, skipping every call
+ * that already has one: calls recorded in the synced-call store (live webhook
+ * tasks and earlier syncs), and calls whose UUID already appears in a task on
+ * the list.
+ */
+async function syncRecentCdrs(session, acct, publicBaseUrl) {
+  const authId = session.authId;
+  console.log(`[backend] Fetching recent CDRs from Vobiz for ${authId}...`);
+  const r = await vobiz(authId, acct.authToken, "GET", `/cdr/recent?limit=${CDR_SYNC_LIMIT}`);
+  const cdrs = (r.ok && r.json && Array.isArray(r.json.data) ? r.json.data : []).filter((c) => c && c.uuid);
+
+  const pending = cdrs.filter((c) => !isCallSynced(authId, c.uuid));
+  const onList = pending.length ? await callUuidsInClickUpList(pending.map((c) => String(c.uuid))) : new Set();
+  for (const u of onList) markCallSynced(authId, u);
+
+  const syncedTasks = [];
+  const skipped = [];
+  for (const cdr of cdrs) {
+    const uuid = String(cdr.uuid);
+    if (isCallSynced(authId, uuid)) {
+      skipped.push(uuid);
+      continue;
+    }
+    const local = callsByUuid.get(uuid);
+    const recordingId = await recordingIdForCall(authId, acct.authToken, uuid);
+    const task = await createClickUpCallTask(
+      {
+        authId,
+        callUuid: uuid,
+        direction: cdr.call_direction || "Outbound",
+        from: cdr.caller_id_number || "",
+        to: cdr.destination_number || "",
+        // The agent who handled it, when this server saw the call; otherwise
+        // nobody can say, and the task is left unassigned.
+        agentId: local && local.authId === authId ? local.agentId || "" : "",
+        durationSeconds: parseInt(cdr.duration || 0, 10),
+        recordingId,
+        hangupCause: cdr.hangup_cause || "NORMAL_CLEARING",
+      },
+      publicBaseUrl
+    );
+    if (isRealTask(task)) markCallSynced(authId, uuid);
+    syncedTasks.push({ uuid, clickUpTask: task });
+  }
+
+  console.log(`[sync-cdrs] ${authId}: ${cdrs.length} fetched, ${syncedTasks.length} new task(s), ${skipped.length} already synced`);
+  return {
+    status: "success",
+    totalFetched: cdrs.length,
+    created: syncedTasks.filter((t) => !t.clickUpTask || !t.clickUpTask.error).length,
+    skipped: skipped.length,
+    syncedTasks,
+  };
+}
+
 // ─── HTTP Server & Route Handlers ───────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
   withCors(res, req);
@@ -860,6 +1039,7 @@ const server = http.createServer(async (req, res) => {
       service: "vobiz-clickup-calling",
       publicBaseUrl: getPublicBaseUrl(req),
       vobizRegistrar: VOBIZ_REGISTRAR,
+      vobizRegistrarWss: VOBIZ_REGISTRAR_WSS,
       clickUpConfigured: !!(CLICKUP_API_TOKEN && !CLICKUP_API_TOKEN.includes("YOUR_CLICKUP")),
       activeCallsCount: callsByUuid.size,
       timestamp: new Date().toISOString(),
@@ -896,7 +1076,11 @@ const server = http.createServer(async (req, res) => {
   if (pathname === "/login" && method === "POST") {
     try {
       const body = await readJsonBody(req);
-      const agentId = String(body.agentId || "admin").trim() || "admin";
+      const agentId = String(body.agentId || "").trim();
+      if (!AGENT_ID_RE.test(agentId)) {
+        sendJson(res, 400, { error: "Enter your agent ID: 1-30 letters, digits, - or _." });
+        return;
+      }
       const authId = String(body.authId || "").trim();
       const authToken = String(body.authToken || "").trim();
       if (!authId || !authToken) {
@@ -1151,15 +1335,22 @@ const server = http.createServer(async (req, res) => {
       displayName: agentObj.name || s.agentId,
       sipUser: `${s.sipUser}@${VOBIZ_REGISTRAR}`,
       sipPassword: s.sipPassword,
-      registrarUrl: `wss://${VOBIZ_REGISTRAR}:5063/`,
+      registrarUrl: VOBIZ_REGISTRAR_WSS,
     });
     return;
   }
 
-  // 2g. List Agents
+  // 2g. List Agents — full profiles, ClickUp user ids included, signed in only.
   if (pathname === "/api/agents" && method === "GET") {
     if (!requireAccountSession(req, res)) return;
     sendJson(res, 200, getAllAgents());
+    return;
+  }
+
+  // 2g-bis. Agent profiles for the sign-in form. Read before anyone signs in,
+  // so it carries the id and display name only: no ClickUp user id or email.
+  if (pathname === "/api/agent-profiles" && method === "GET") {
+    sendJson(res, 200, { profiles: listAgentProfiles() });
     return;
   }
 
@@ -1220,6 +1411,7 @@ const server = http.createServer(async (req, res) => {
         },
         getPublicBaseUrl(req)
       );
+      if (isRealTask(task)) markCallSynced(rec.authId, rec.callUuid);
 
       sendJson(res, 200, { ok: true, success: true, task, record: rec });
     } catch (err) {
@@ -1648,34 +1840,17 @@ ${users}
       sendJson(res, 409, { error: "Sign in again to sync CDRs." });
       return;
     }
-    console.log(`[backend] Fetching recent CDRs from Vobiz for ${s.authId}...`);
-    const publicBaseUrl = getPublicBaseUrl(req);
-
+    // One sync per account at a time: two clicks racing would both see a CDR
+    // as new and both create its task.
+    const previous = cdrSyncs.get(s.authId) || Promise.resolve();
+    const run = previous.catch(() => {}).then(() => syncRecentCdrs(s, acct, getPublicBaseUrl(req)));
+    cdrSyncs.set(s.authId, run);
     try {
-      const r = await vobiz(s.authId, acct.authToken, "GET", "/cdr/recent?limit=5");
-      const cdrs = r.ok && r.json && Array.isArray(r.json.data) ? r.json.data : [];
-
-      const syncResults = [];
-      for (const cdr of cdrs) {
-        const task = await createClickUpCallTask(
-          {
-            authId: s.authId,
-            callUuid: cdr.uuid,
-            direction: cdr.call_direction || "Outbound",
-            from: cdr.caller_id_number || "",
-            to: cdr.destination_number || "",
-            agentId: s.agentId,
-            durationSeconds: parseInt(cdr.duration || 0, 10),
-            hangupCause: cdr.hangup_cause || "NORMAL_CLEARING",
-          },
-          publicBaseUrl
-        );
-        syncResults.push({ uuid: cdr.uuid, clickUpTask: task });
-      }
-
-      sendJson(res, 200, { status: "success", totalFetched: cdrs.length, syncedTasks: syncResults });
+      sendJson(res, 200, await run);
     } catch (err) {
       sendJson(res, 500, { error: err.message });
+    } finally {
+      if (cdrSyncs.get(s.authId) === run) cdrSyncs.delete(s.authId);
     }
     return;
   }

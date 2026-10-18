@@ -9,13 +9,15 @@
  *  3. Caller ID selection from the account's own numbers
  *  4. Outbound /answer routed to the right account
  *  5. Inbound /answer routed by ParentAuthID, then by dialled number
- *  6. CDR to ClickUp task
+ *  6. CDR to ClickUp task, assigned to the agent's ClickUp user
  *  7. Recordings, account-scoped
+ *  7b. Sync CDRs: idempotent, with recording links
  *  8. Panel assets
  *  9. Security properties, including "no Auth Token in any HTTP response"
  */
 
 const net = require("net");
+const vm = require("vm");
 const fs = require("fs");
 const path = require("path");
 
@@ -24,6 +26,7 @@ const BASE_URL = `http://127.0.0.1:${PORT}`;
 const MOCK_URL = process.env.MOCK_URL || "";
 const DATA_DIR = process.env.DATA_DIR || "";
 const ACCOUNTS = JSON.parse(process.env.TEST_ACCOUNTS || "{}");
+const REGISTRAR = process.env.VOBIZ_REGISTRAR || "registrar.vobiz.ai";
 
 const A = "MA_TEST0001";
 const B = "MA_TEST0002";
@@ -120,6 +123,10 @@ async function runTests() {
   const health = await request("/health");
   assert(health.status === 200, "GET /health returns HTTP 200");
   assert(health.json && health.json.service === "vobiz-clickup-calling", "Service identifier is 'vobiz-clickup-calling'");
+  assert(
+    health.json && health.json.vobizRegistrar === REGISTRAR && health.json.vobizRegistrarWss === `wss://${REGISTRAR}:5063/`,
+    "/health tells the panel the configured VOBIZ_REGISTRAR and its WebSocket URL"
+  );
 
   // 2. Sign-in with any Vobiz account
   console.log("\n[2/9] Sign-in with any Vobiz account...");
@@ -134,6 +141,22 @@ async function runTests() {
 
   const missing = await post("/login", { agentId: "admin", authId: A });
   assert(missing.status === 400, "sign-in without an Auth Token is a 400");
+
+  const noAgent = await post("/login", { authId: A, authToken: TOKEN_A });
+  assert(noAgent.status === 400 && !(noAgent.json && noAgent.json.token), "sign-in without an agent ID is a 400, not a built-in default agent");
+  const badAgent = await post("/login", { agentId: "no spaces!", authId: A, authToken: TOKEN_A });
+  assert(badAgent.status === 400, "an agent ID outside letters, digits, - and _ is refused");
+
+  const profiles = await request("/api/agent-profiles");
+  const profileIds = ((profiles.json && profiles.json.profiles) || []).map((p) => p.id);
+  assert(profiles.status === 200 && profileIds.join() === "admin,agent1,ghost", "GET /api/agent-profiles lists the agents in agents.json, before sign-in");
+  assert(
+    profiles.json.profiles.find((p) => p.id === "admin").name === "Test Admin",
+    "each profile carries its display name"
+  );
+  assert(!profiles.text.includes("555001") && !profiles.text.includes("@example.test"), "the public profile list carries no ClickUp user id or email");
+  const agentsAnon = await request("/api/agents");
+  assert(agentsAnon.status === 401, "the full agent list, with ClickUp ids, still needs a session");
 
   const loginA = await post("/login", { agentId: "admin", authId: A, authToken: TOKEN_A });
   assert(loginA.status === 200 && loginA.json && loginA.json.token, "account A signs in");
@@ -157,6 +180,10 @@ async function runTests() {
   const userA = sipUserOf(sipA);
   const userB = sipUserOf(sipB);
   assert(sipA.status === 200 && sipA.json.sipPassword && sipA.json.registrarUrl.startsWith("wss://"), "A gets SIP credentials for its softphone");
+  assert(
+    sipA.json.sipUser.endsWith(`@${REGISTRAR}`) && sipA.json.registrarUrl === `wss://${REGISTRAR}:5063/`,
+    "the softphone's SIP domain and registrar are VOBIZ_REGISTRAR"
+  );
   assert(userA && userB && userA !== userB, "the two accounts get distinct endpoints");
   assert(/^[A-Za-z0-9]+$/.test(userA) && userA.includes("1187694299"), "the SIP user is the stored (rewritten) username, read back from Vobiz");
 
@@ -299,7 +326,7 @@ async function runTests() {
   const inByDid = await postForm("/answer", { From: "+15550188887", To: NUM_B, CallUUID: "in_b", Direction: "inbound" });
   assert(inByDid.text.includes(`<User>sip:${userB}@`) && !inByDid.text.includes(userA), "without ParentAuthID, the dialled number finds account B");
   const inSip = await postForm("/answer", { From: "+15550188886", To: "+910000000009", CallUUID: "in_sip", Direction: "inbound" });
-  assert(inSip.text.includes("<User>sip:directagent01@"), "a SIP Direct agent's number rings that agent");
+  assert(inSip.text.includes(`<User>sip:directagent01@${REGISTRAR}</User>`), "a SIP Direct agent's number rings that agent, at VOBIZ_REGISTRAR");
   const inNobody = await postForm("/answer", { From: "+15550188885", To: "+910000000077", CallUUID: "in_none", Direction: "inbound" });
   assert(inNobody.text.includes("<Hangup") && !inNobody.text.includes("<Dial"), "a number no signed-in account owns gets a polite hangup");
   assert(!inNobody.text.includes("Polly."), "inbound XML uses no voice outside the documented <Speak> set");
@@ -332,9 +359,24 @@ async function runTests() {
   assert(String(createdBody.description || "").includes("(52s)"), "task carries the B-leg duration");
   assert(String(createdBody.description || "").includes(NUM_A), "task records A's caller ID");
   assert(!("status" in createdBody), "no hardcoded status is sent");
+  assert(JSON.stringify(createdBody.assignees) === "[555001]", "the task is assigned to the agent's clickUpUserId from agents.json");
+  assert(String(createdBody.description || "").includes("Test Admin"), "the task names the agent by their agents.json name");
 
   const simCall = await post("/test-simulated-call", { direction: "inbound", from: "+15550188888", duration: 64 }, bearer(tokA2));
   assert(simCall.status === 200 && simCall.json.clickUpTask.description.includes("Call Detail Record"), "POST /test-simulated-call logs a structured CDR");
+
+  await post("/test-simulated-call", { direction: "outbound", to: "+15550133333", callUuid: "sim_agent1" }, bearer(tokA1));
+  const agent1Task = (await upstream()).find((r) => r.method === "POST" && r.url === "/clickup/list/list_1/task" && r.body.includes("sim_agent1"));
+  assert(agent1Task && !("assignees" in JSON.parse(agent1Task.body)), "an agent with no clickUpUserId gets an unassigned task");
+
+  const loginGhost = await post("/login", { agentId: "ghost", authId: B, authToken: TOKEN_B });
+  const ghostSim = await post("/test-simulated-call", { direction: "outbound", to: "+15550122222", callUuid: "sim_ghost" }, bearer(loginGhost.json.token));
+  const ghostPosts = (await upstream()).filter((r) => r.method === "POST" && r.url === "/clickup/list/list_1/task" && r.body.includes("sim_ghost"));
+  assert(
+    ghostPosts.length === 2 && JSON.parse(ghostPosts[0].body).assignees[0] === 999 && !("assignees" in JSON.parse(ghostPosts[1].body)),
+    "when ClickUp refuses the assignee, the task is created again unassigned"
+  );
+  assert(ghostSim.json && ghostSim.json.clickUpTask && ghostSim.json.clickUpTask.id && !ghostSim.json.clickUpTask.error, "so the call is still logged");
 
   // 7. Recordings
   console.log("\n[7/9] Recordings, account-scoped...");
@@ -379,6 +421,45 @@ async function runTests() {
   const crossViewer = await request(`/recording-audio/rec_A1?a=${A}`, { headers: bearer(tokB) });
   assert(crossViewer.status === 403, "B's session cannot play A's recording unsigned");
 
+  // 7b. Sync CDRs
+  console.log("\n[7b/9] Sync CDRs, idempotent...");
+  const taskPosts = async (needle) =>
+    (await upstream()).filter((r) => r.method === "POST" && r.url === "/clickup/list/list_1/task" && r.body.includes(needle));
+  const sync1 = await request("/sync-recent-cdrs", { headers: bearer(tokA2) });
+  assert(sync1.status === 200 && sync1.json.totalFetched === 3, "Sync CDRs reads the account's recent CDRs");
+  assert(sync1.json.created === 1 && sync1.json.skipped === 2, "only the CDR with no task yet becomes a task");
+  assert((await taskPosts("`out_a`")).length === 1, "a call the live webhooks already logged is not imported again");
+  assert((await taskPosts("cdr_on_list")).length === 0, "a call whose UUID a task on the list already names is skipped");
+  const cdrTask = (await taskPosts("cdr_a1"))[0];
+  assert(Boolean(cdrTask), "the new CDR gets a ClickUp task");
+  assert(
+    cdrTask && JSON.parse(cdrTask.body).description.includes(`/recording-audio/rec_A1?a=${A}&exp=`),
+    "a synced CDR's task carries the signed recording link, like a live call's"
+  );
+  up = await upstream();
+  assert(up.some((r) => r.authId === A && /\/Recording\/\?call_uuid=cdr_a1/.test(r.url)), "the recording is found by the CDR's call UUID");
+
+  const sync2 = await request("/sync-recent-cdrs", { headers: bearer(tokA2) });
+  assert(sync2.status === 200 && sync2.json.created === 0 && sync2.json.skipped === 3, "a second Sync CDRs creates nothing");
+  assert((await taskPosts("cdr_a1")).length === 1, "pressing Sync CDRs again does not duplicate a task");
+
+  const [race1, race2] = await Promise.all([
+    request("/sync-recent-cdrs", { headers: bearer(tokB) }),
+    request("/sync-recent-cdrs", { headers: bearer(tokB) }),
+  ]);
+  assert(race1.status === 200 && race2.status === 200, "two Sync CDRs at once both succeed");
+  assert((await taskPosts("cdr_b1")).length === 1, "two Sync CDRs at once still create one task per call");
+
+  if (DATA_DIR) {
+    const file = path.join(DATA_DIR, "synced-calls.json");
+    const stat = fs.statSync(file);
+    const stored = JSON.parse(fs.readFileSync(file, "utf8"));
+    assert((stat.mode & 0o777) === 0o600, "synced-calls.json is mode 0600");
+    assert(stored[A].includes("out_a") && stored[A].includes("cdr_a1") && stored[B].includes("cdr_b1"), "synced calls are remembered per account");
+    const raw = JSON.stringify(stored);
+    assert(!raw.includes(TOKEN_A) && !raw.includes(TOKEN_B), "no token is written to the synced-call store");
+  }
+
   // 8. Panel
   console.log("\n[8/9] Panel assets...");
   const indexHtml = await request("/clickup-app/index.html");
@@ -395,6 +476,58 @@ async function runTests() {
   assert(vobizSip.status === 200 && vobizSip.text.includes("connectDirect"), "serves the SIP layer with both connect modes");
   const softphone = await request("/clickup-app/softphone.js");
   assert(softphone.status === 200 && softphone.text.includes("inboundCallDoneModal"), "serves the softphone controller");
+  assert(
+    !/<option value="(admin|agent1)"/.test(indexHtml.text) && !/John Doe|System Administrator/.test(indexHtml.text),
+    "index.html hard-codes no agent profile"
+  );
+  assert(/<input[^>]*id="loginAgentInput"[^>]*list="agentProfiles"/.test(indexHtml.text) && indexHtml.text.includes('<datalist id="agentProfiles">'), "the agent ID is free text, with the backend's profiles as suggestions");
+  assert(softphone.text.includes("/api/agent-profiles"), "the softphone loads the profiles from the backend");
+  assert(!/"admin"/.test(softphone.text), "the softphone has no built-in default agent");
+  assert(!/transfer/i.test(indexHtml.text) && !/transfer/i.test(softphone.text), "there is no Transfer button, and no transfer code behind one");
+  assert(!vobizSip.text.includes("registrar.vobiz.ai"), "vobiz-sip.js carries no registrar of its own");
+
+  // Run the SIP layer against stub JsSIP: SIP direct must register, and dial,
+  // at the registrar the backend names.
+  const seen = { cfg: null, socketUrl: "", target: "" };
+  const sandbox = {
+    fetch,
+    console: { log() {}, warn() {}, error() {} },
+    navigator: { mediaDevices: { getUserMedia() {} } },
+    JsSIP: {
+      WebSocketInterface: class {
+        constructor(u) {
+          seen.socketUrl = u;
+        }
+      },
+      UA: class {
+        constructor(cfg) {
+          seen.cfg = cfg;
+          this.handlers = {};
+        }
+        on(e, f) {
+          this.handlers[e] = f;
+        }
+        start() {
+          if (this.handlers.registered) this.handlers.registered();
+        }
+        call(t) {
+          seen.target = t;
+          return { on() {}, connection: null };
+        }
+        unregister() {}
+        stop() {}
+        removeAllListeners() {}
+      },
+    },
+  };
+  sandbox.window = sandbox;
+  vm.runInNewContext(vobizSip.text, sandbox);
+  const directOk = await sandbox.VobizSip.connectDirect({ sipUser: "directagent01", sipPassword: "x", backendUrl: BASE_URL });
+  sandbox.VobizSip.call("+1 555 019 9999");
+  assert(directOk && seen.cfg && seen.cfg.uri === `sip:directagent01@${REGISTRAR}`, "SIP Direct registers as user@VOBIZ_REGISTRAR");
+  assert(seen.socketUrl === `wss://${REGISTRAR}:5063/`, "SIP Direct connects to VOBIZ_REGISTRAR's WebSocket");
+  assert(seen.target === `sip:+15550199999@${REGISTRAR}`, "the dial target is at VOBIZ_REGISTRAR");
+
   const css = await request("/clickup-app/style.css");
   assert(css.status === 200 && css.text.includes(".call-done-modal-backdrop"), "serves the stylesheet");
 

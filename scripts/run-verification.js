@@ -23,6 +23,9 @@
  *     from the documented {"application": <int>}, so the fallback is exercised.
  * It records every request so the suite can assert what the backend did not do
  * as well as what it did.
+ *
+ * The ClickUp stand-in keeps the tasks it was given, so a list read shows them,
+ * and refuses a task assigned to user 999, which is not in the workspace.
  */
 const { spawn } = require("child_process");
 const fs = require("fs");
@@ -49,6 +52,13 @@ const ACCOUNTS = {
     apps: [{ app_id: "11111111111111111", answer_url: "https://other-integration.example/answer" }],
     nextAppId: "43919358318796814",
     recordings: [{ recording_id: "rec_A1", call_uuid: "cdr_a1", add_time: "2026-01-01 10:00", rounded_recording_duration: 30 }],
+    // Recent CDRs: one the live webhooks already logged (out_a), one with a
+    // recording (cdr_a1), and one a task on the list already names.
+    cdrs: [
+      { uuid: "out_a", call_direction: "outbound", caller_id_number: "+910000000001", destination_number: "+15550199999", duration: 52, hangup_cause: "NORMAL_CLEARING" },
+      { uuid: "cdr_a1", call_direction: "inbound", caller_id_number: "+15550166666", destination_number: "+910000000001", duration: 30, hangup_cause: "NORMAL_CLEARING" },
+      { uuid: "cdr_on_list", call_direction: "outbound", caller_id_number: "+910000000001", destination_number: "+15550155555", duration: 12, hangup_cause: "NORMAL_CLEARING" },
+    ],
   },
   MA_TEST0002: {
     token: "tok-two-SECRET-0002-do-not-leak",
@@ -57,6 +67,7 @@ const ACCOUNTS = {
     apps: [],
     nextAppId: "43919358318796999",
     recordings: [{ recording_id: "rec_B1", call_uuid: "cdr_b1", add_time: "2026-01-01 11:00", rounded_recording_duration: 40 }],
+    cdrs: [{ uuid: "cdr_b1", call_direction: "outbound", caller_id_number: "+910000000002", destination_number: "+15550144444", duration: 40, hangup_cause: "NORMAL_CLEARING" }],
   },
 };
 const endpoints = new Map(); // endpointId -> { authId, username, alias, application }
@@ -67,6 +78,9 @@ endpoints.set("69999999", { authId: "MA_TEST0002", username: "cuagent1preexistin
 
 const mockRequests = [];
 let taskSeq = 0;
+// ClickUp tasks on list_1. One was made by hand (or an older install) and
+// names a call in its description.
+const clickupTasks = [{ id: "task_seed", name: "Older call", description: "| **Call UUID** | `cdr_on_list` |" }];
 
 function appIdLiteral(id) {
   // A bare number, exactly as text — the shape that breaks JSON.parse.
@@ -150,13 +164,17 @@ function handleVobiz(req, res, body) {
     res.statusCode = 202;
     return res.end("{}");
   }
-  if (sub === "/Recording/" && req.method === "GET") return res.end(JSON.stringify({ objects: acct.recordings }));
+  if (sub === "/Recording/" && req.method === "GET") {
+    const callUuid = new URLSearchParams((m[3] || "").slice(1)).get("call_uuid");
+    const objects = callUuid ? acct.recordings.filter((r) => r.call_uuid === callUuid) : acct.recordings;
+    return res.end(JSON.stringify({ objects }));
+  }
   if (/^\/Recording\/[^/]+\/$/.test(sub)) {
     // Never hand back a media URL: following it would leave the machine.
     res.statusCode = 404;
     return res.end("{}");
   }
-  if (sub.startsWith("/cdr/recent")) return res.end(JSON.stringify({ data: [] }));
+  if (sub.startsWith("/cdr/recent")) return res.end(JSON.stringify({ success: true, data: acct.cdrs || [] }));
   if (/\/Call\//.test(sub)) return res.end(JSON.stringify({ request_uuid: "should-never-happen" }));
   return res.end("{}");
 }
@@ -176,8 +194,18 @@ const mock = http.createServer((req, res) => {
     mockRequests.push({ method: req.method, url: req.url, authId: req.headers["x-auth-id"] || "", body });
     res.setHeader("Content-Type", "application/json");
     if (req.url.startsWith("/clickup/")) {
+      if (req.method === "GET" && /^\/clickup\/list\/[^/]+\/task/.test(req.url)) {
+        return res.end(JSON.stringify({ tasks: clickupTasks }));
+      }
       const parsed = body ? JSON.parse(body) : {};
-      const id = req.method === "PUT" ? req.url.split("/").pop() : `task_${++taskSeq}`;
+      if (req.method === "POST" && Array.isArray(parsed.assignees) && parsed.assignees.includes(999)) {
+        res.statusCode = 400;
+        return res.end(JSON.stringify({ err: "Assignee not found", ECODE: "ITEM_015" }));
+      }
+      const id = req.method === "PUT" ? decodeURIComponent(req.url.split("/").pop()) : `task_${++taskSeq}`;
+      const existing = clickupTasks.find((t) => t.id === id);
+      if (existing) Object.assign(existing, parsed);
+      else clickupTasks.push({ ...parsed, id });
       return res.end(JSON.stringify({ ...parsed, id, url: `https://app.clickup.com/t/${id}` }));
     }
     return handleVobiz(req, res, body);
@@ -186,6 +214,19 @@ const mock = http.createServer((req, res) => {
 
 const DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "vobiz-clickup-test-"));
 
+// Agent profiles for the suite, outside the repo: admin has a ClickUp user,
+// agent1 has none, ghost names a user the workspace does not have.
+const AGENTS_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "vobiz-clickup-agents-"));
+const AGENTS_FILE = path.join(AGENTS_DIR, "agents.json");
+fs.writeFileSync(
+  AGENTS_FILE,
+  JSON.stringify({
+    admin: { name: "Test Admin", clickUpUserId: "555001", clickUpEmail: "admin@example.test" },
+    agent1: { name: "Test Agent One" },
+    ghost: { name: "Ghost Agent", clickUpUserId: "999" },
+  })
+);
+
 const TEST_ENV = {
   ...process.env,
   PORT: String(PORT),
@@ -193,6 +234,9 @@ const TEST_ENV = {
   MOCK_URL: `http://127.0.0.1:${MOCK_PORT}`,
   TUNNEL_URL: `http://127.0.0.1:${PORT}`,
   DATA_DIR,
+  AGENTS_FILE,
+  // Not Vobiz's default, so a registrar baked into the panel would show.
+  VOBIZ_REGISTRAR: "sip.registrar.test.invalid",
   SIGNING_SECRET: "test_signing_secret",
   CLICKUP_API_TOKEN: "pk_test_token",
   CLICKUP_LIST_ID: "list_1",
@@ -228,6 +272,7 @@ function shutdown(code) {
   mock.close();
   try {
     fs.rmSync(DATA_DIR, { recursive: true, force: true });
+    fs.rmSync(AGENTS_DIR, { recursive: true, force: true });
   } catch {
     /* best effort */
   }

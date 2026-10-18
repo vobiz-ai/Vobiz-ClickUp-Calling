@@ -5,15 +5,37 @@
  * 1. connect({ token, audioElement, backendUrl }) - Vobiz account mode: the
  *    backend provisioned this agent's endpoint in the signed-in account and
  *    minted a SIP password for this session.
- * 2. connectDirect({ sipUser, sipPassword, displayName, registrarUrl, audioElement }) - SIP direct mode:
+ * 2. connectDirect({ sipUser, sipPassword, displayName, audioElement, backendUrl }) - SIP direct mode:
  *    an existing endpoint's credentials, typed by the agent, never sent to the backend.
+ *
+ * The SIP domain and WebSocket registrar are the backend's VOBIZ_REGISTRAR,
+ * never a value baked into this file: account mode gets them with the
+ * session's credentials, SIP direct reads them from the backend's /health.
  *
  * Exposes window.VobizSip.
  */
 (function () {
   "use strict";
 
-  const REGISTRAR_HOST = "registrar.vobiz.ai";
+  // { host, wss } from the backend, loaded once.
+  let registrarConfig = null;
+
+  async function loadRegistrar(backendUrl = "") {
+    if (registrarConfig) return registrarConfig;
+    const res = await fetch(`${backendUrl}/health`);
+    const json = await res.json().catch(() => ({}));
+    const host = String((json && json.vobizRegistrar) || "").trim();
+    if (!res.ok || !host) throw new Error("The backend did not say which Vobiz registrar to use");
+    registrarConfig = { host, wss: json.vobizRegistrarWss || `wss://${host}:5063/` };
+    return registrarConfig;
+  }
+
+  /** The SIP domain of the registered identity: the part after "@". */
+  function sipDomain() {
+    const uri = String((identity && identity.sipUser) || "").replace(/^sip:/, "");
+    const at = uri.indexOf("@");
+    return at === -1 ? "" : uri.slice(at + 1);
+  }
 
   let ua = null;
   let session = null;
@@ -57,7 +79,11 @@
 
     identity = creds;
     const cleanUri = creds.sipUser.startsWith("sip:") ? creds.sipUser : `sip:${creds.sipUser}`;
-    const regUrl = creds.registrarUrl || `wss://${REGISTRAR_HOST}:5063/`;
+    const regUrl = creds.registrarUrl;
+    if (!regUrl || !/@/.test(cleanUri)) {
+      emit("error", new Error("No registrar configured for this softphone"));
+      return false;
+    }
     const socket = new JsSIP.WebSocketInterface(regUrl);
 
     ua = new JsSIP.UA({
@@ -147,18 +173,26 @@
     return initUA(creds, audioElement);
   }
 
-  function connectDirect({ sipUser, sipPassword, displayName, registrarUrl, audioElement }) {
+  async function connectDirect({ sipUser, sipPassword, displayName, audioElement, backendUrl = "" }) {
     if (typeof JsSIP === "undefined") {
       emit("error", new Error("JsSIP failed to load — clickup-app/lib/jssip.min.js is missing or blocked"));
       return false;
     }
 
-    const cleanUser = sipUser.includes("@") ? sipUser : `${sipUser}@${REGISTRAR_HOST}`;
+    let registrar;
+    try {
+      registrar = await loadRegistrar(backendUrl);
+    } catch (err) {
+      emit("error", err);
+      return false;
+    }
+
+    const bareUser = String(sipUser).replace(/^sip:/, "").split("@")[0];
     const creds = {
-      sipUser: cleanUser,
+      sipUser: `${bareUser}@${registrar.host}`,
       sipPassword,
-      displayName: displayName || sipUser,
-      registrarUrl: registrarUrl || `wss://${REGISTRAR_HOST}:5063/`
+      displayName: displayName || bareUser,
+      registrarUrl: registrar.wss,
     };
 
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -186,7 +220,12 @@
       return null;
     }
     const cleanNumber = String(number).replace(/[^\d+]/g, "");
-    const target = `sip:${cleanNumber}@${REGISTRAR_HOST}`;
+    const domain = sipDomain();
+    if (!domain) {
+      emit("error", new Error("No registrar configured for this softphone"));
+      return null;
+    }
+    const target = `sip:${cleanNumber}@${domain}`;
     try {
       session = ua.call(target, {
         extraHeaders: Array.isArray(extraHeaders) ? extraHeaders : [],

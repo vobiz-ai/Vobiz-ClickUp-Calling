@@ -9,7 +9,7 @@
  *      straight from the browser, never sent to the backend) plus a caller ID.
  * 2. Incoming call popup banner with Web Audio ringtone & Accept/Decline keyboard shortcuts.
  * 3. Inbound call completed notification popup modal + native HTML5 desktop notification.
- * 4. Outbound WebRTC calling with custom caller ID headers, DTMF keypad, live timer, mute, hold, transfer.
+ * 4. Outbound WebRTC calling with custom caller ID headers, DTMF keypad, live timer, mute, hold.
  * 5. ClickUp task auto-matching and call recording list with proxy playback.
  */
 
@@ -51,7 +51,8 @@ document.addEventListener("DOMContentLoaded", () => {
   // Account Mode Form
   const authIdInput = document.getElementById("vobiz-auth-id");
   const authTokenInput = document.getElementById("vobiz-auth-token");
-  const agentSelect = document.getElementById("loginAgentSelect");
+  const agentInput = document.getElementById("loginAgentInput");
+  const agentProfilesList = document.getElementById("agentProfiles");
   const accountLoginBtn = document.getElementById("vobiz-login-btn");
 
   const loginStatusEl = document.getElementById("vobiz-login-status");
@@ -72,7 +73,6 @@ document.addEventListener("DOMContentLoaded", () => {
   const callControls = document.getElementById("callControls");
   const muteBtn = document.getElementById("muteBtn");
   const holdBtn = document.getElementById("holdBtn");
-  const transferBtn = document.getElementById("transferBtn");
 
   // ClickUp Task Box
   const clickupTaskBox = document.getElementById("clickupTaskBox");
@@ -95,6 +95,9 @@ document.addEventListener("DOMContentLoaded", () => {
   const AUTH_MODE_KEY = "vobiz_clickup_auth_mode";
   const SIP_CREDS_KEY = "vobiz_clickup_sip_creds";
   const SESSION_KEY = "vobiz_clickup_session";
+  const AGENT_ID_KEY = "vobiz_clickup_agent_id";
+  // The same rule the backend applies: the ID names this agent's SIP endpoint.
+  const AGENT_ID_RE = /^[A-Za-z0-9_-]{1,30}$/;
 
   let backendUrl = window.location.origin;
   let authMode = "account"; // "account" | "sip"
@@ -111,6 +114,8 @@ document.addEventListener("DOMContentLoaded", () => {
   let isOnHold = false;
   let currentCallStartTime = null;
   let sessionToken = "";
+  // The agent ID of the signed-in session, as the backend confirmed it.
+  let signedInAgentId = "";
   // From GET /api/numbers: [{ e164, applicationId }] — the application each
   // number is attached to now, and this integration's own application.
   let numberDetails = [];
@@ -398,11 +403,17 @@ document.addEventListener("DOMContentLoaded", () => {
   async function vobizAccountLogin() {
     const authId = authIdInput.value.trim();
     const authToken = authTokenInput.value.trim();
-    const agentId = agentSelect.value || "admin";
+    const agentId = agentInput ? agentInput.value.trim() : "";
 
     if (!authId || !authToken) {
       setLoginStatus("Enter both Auth ID and Auth Token.");
       setStatus("Credentials required", "error");
+      return;
+    }
+    if (!AGENT_ID_RE.test(agentId)) {
+      setLoginStatus("Enter your agent ID: 1-30 letters, digits, - or _.");
+      setStatus("Agent ID required", "error");
+      if (agentInput) agentInput.focus();
       return;
     }
 
@@ -423,6 +434,8 @@ document.addEventListener("DOMContentLoaded", () => {
       }
 
       sessionToken = data.token || "";
+      signedInAgentId = data.agentId || agentId;
+      storageSet(AGENT_ID_KEY, signedInAgentId);
       localStorage.setItem(SESSION_KEY, JSON.stringify({
         token: sessionToken,
         agentId,
@@ -522,7 +535,7 @@ document.addEventListener("DOMContentLoaded", () => {
             "Content-Type": "application/json",
             ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {})
           },
-          body: JSON.stringify({ number: selected, agentId: agentSelect.value })
+          body: JSON.stringify({ number: selected })
         });
         updateDialButtonState();
       } catch (e) {
@@ -596,11 +609,13 @@ document.addEventListener("DOMContentLoaded", () => {
     if (logoutBtn) logoutBtn.classList.remove("hidden");
     updateDialButtonState();
 
-    const ok = window.VobizSip.connectDirect({
+    signedInAgentId = sipUser;
+    const ok = await window.VobizSip.connectDirect({
       sipUser,
       sipPassword,
       displayName: sipUser,
       audioElement: remoteAudio,
+      backendUrl,
     });
     if (!ok) {
       setStatus("SIP Error", "error");
@@ -621,6 +636,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     localStorage.removeItem(SESSION_KEY);
     sessionToken = "";
+    signedInAgentId = "";
     accountReady = false;
     sipRegistered = false;
 
@@ -813,7 +829,7 @@ document.addEventListener("DOMContentLoaded", () => {
           body: JSON.stringify({
             callUuid,
             durationSeconds: durationSec,
-            agentId: agentSelect.value || "admin",
+            agentId: signedInAgentId,
             direction: currentCallDirection,
             to: callerNumber,
             from: callerId
@@ -870,7 +886,7 @@ document.addEventListener("DOMContentLoaded", () => {
       const extraHeaders = [
         `X-VH-Caller-ID: ${callerId}`,
         `X-PH-Caller-ID: ${callerId}`,
-        `X-ClickUp-Agent: ${agentSelect.value || "admin"}`
+        ...(signedInAgentId ? [`X-ClickUp-Agent: ${signedInAgentId}`] : [])
       ];
       const session = window.VobizSip.call(number, remoteAudio, extraHeaders);
       if (!session) {
@@ -980,16 +996,6 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   }
 
-  if (transferBtn) {
-    transferBtn.addEventListener("click", () => {
-      const target = prompt("Enter phone number or extension to transfer this call to:");
-      if (target) {
-        log(`Transferring call to ${target}…`);
-        alert(`Attended transfer initiated to ${target}`);
-      }
-    });
-  }
-
   // ─── Call Recordings & CDR List ───────────────────────────────────────────
 
   async function loadCallHistory() {
@@ -1049,7 +1055,11 @@ document.addEventListener("DOMContentLoaded", () => {
       try {
         const res = await authFetch("/sync-recent-cdrs");
         const json = await res.json();
-        log(`CDR sync completed! Synced ${json.totalFetched || 0} calls.`, "success");
+        if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
+        log(
+          `CDR sync done: ${json.created || 0} new task(s), ${json.skipped || 0} already in ClickUp, ${json.totalFetched || 0} recent call(s) checked.`,
+          "success"
+        );
         loadCallHistory();
       } catch (err) {
         log(`CDR sync error: ${err.message}`, "error");
@@ -1073,7 +1083,30 @@ document.addEventListener("DOMContentLoaded", () => {
     } catch (_) {}
   }
 
+  // Agent profiles come from the backend's agents.json. They are suggestions:
+  // with no agents.json, or for an agent not in it, any agent ID can be typed.
+  async function loadAgentProfiles() {
+    if (agentInput && !agentInput.value) agentInput.value = storageGet(AGENT_ID_KEY) || "";
+    try {
+      const res = await fetch(`${backendUrl}/api/agent-profiles`);
+      if (!res.ok) return;
+      const data = await res.json();
+      const profiles = Array.isArray(data.profiles) ? data.profiles : [];
+      if (agentProfilesList) {
+        agentProfilesList.innerHTML = "";
+        profiles.forEach((p) => {
+          const opt = document.createElement("option");
+          opt.value = p.id;
+          if (p.name) opt.label = p.name;
+          agentProfilesList.appendChild(opt);
+        });
+      }
+      if (agentInput && !agentInput.value && profiles.length === 1) agentInput.value = profiles[0].id;
+    } catch (_) {}
+  }
+
   async function autoRestore() {
+    loadAgentProfiles();
     await loadAvailableNumbers();
 
     const savedMode = storageGet(AUTH_MODE_KEY) || "account";
@@ -1106,6 +1139,7 @@ document.addEventListener("DOMContentLoaded", () => {
         const data = await res.json();
         if (data.loggedIn && data.mode !== "sip") {
           sessionToken = savedSession.token;
+          signedInAgentId = data.agentId || "";
           accountReady = true;
           setStatus("Registering…", "pending");
           updateDialButtonState();
